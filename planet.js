@@ -1,6 +1,8 @@
 // planet.js - procedural planet: params, height field, cube-sphere quadtree LOD, flora
 import * as THREE from './three.module.js';
 import { rng, simplex, hash, makeName } from './noise.js';
+import { makeAtm, terrainMaterial, patchWind, skyMesh, cloudMesh } from './atmosphere.js';
+import { waterMaterial } from './water.js';
 
 const N = 16;            // segments per chunk side
 const SPLIT = 1.7;       // split when distance < chunk size * SPLIT
@@ -127,6 +129,12 @@ export function makeParams(seed, forceType) {
     p.maxDepth = Math.max(3, Math.round(Math.log2(p.R * 1.5708 / 12)));
     p.bigDepth = Math.max(2, Math.round(Math.log2(p.R * 1.5708 / 100)));
     p.smallDepth = p.bigDepth + 2;
+    p.grassDepth = Math.min(p.maxDepth, p.bigDepth + 3);
+    p.grass = { lush: 1.3, ocean: 1.2, toxic: 0.9, exotic: 1.1, desert: 0.25, frozen: 0.15, barren: 0 }[type];
+    p.ring = r() < 0.35;
+    p.c.seabed = c.shore.clone().lerp(c.deep, 0.5).lerp(c.rock, 0.35);
+    p.coral = hsl(r(), 0.8, 0.55);
+    p.coral2 = hsl(r(), 0.7, 0.5);
     return p;
 }
 
@@ -180,10 +188,9 @@ function heightFns(p) {
 const _c = new THREE.Color();
 function colorAt(p, h, slope, dn, out, k) {
     const c = p.c;
-    if (p.hasSea && h < p.sea + 0.05) {
-        // h is raw height here; deeper is darker
-        const t = Math.min(1, (p.sea - h) / 60);
-        _c.copy(c.water).lerp(c.deep, t);
+    if (p.hasSea && h < p.sea + 0.4) {
+        const t = Math.min(1, Math.max(0, (p.sea - h) / 22));
+        _c.copy(c.shore).lerp(c.seabed, t);
     } else {
         const t = (h - p.sea) / p.relief;
         if (t < 0.012) _c.copy(c.shore);
@@ -213,23 +220,22 @@ function chunkIndex() {
         const a = j * S + i, b = a + 1, c = a + S + 1, d = a + S;
         idx.push(a, b, c, a, c, d);
     }
-    // skirts: edge vertices duplicated after main grid
     const base = S * S;
     const edge = edgeList();
     for (let e = 0; e < edge.length - 1; e++) {
         const a = edge[e], b = edge[e + 1], sa = base + e, sb = base + e + 1;
         idx.push(a, sa, b, b, sa, sb, a, b, sa, b, sb, sa);
     }
-    _index = idx;
-    return idx;
+    _index = new Uint16Array(idx);
+    return _index;
 }
 
 function edgeList() {
     const S = N + 1, l = [];
-    for (let i = 0; i <= N; i++) l.push(i);                 // bottom
-    for (let j = 1; j <= N; j++) l.push(j * S + N);         // right
-    for (let i = N - 1; i >= 0; i--) l.push(N * S + i);     // top
-    for (let j = N - 1; j >= 0; j--) l.push(j * S);         // left
+    for (let i = 0; i <= N; i++) l.push(i);
+    for (let j = 1; j <= N; j++) l.push(j * S + N);
+    for (let i = N - 1; i >= 0; i--) l.push(N * S + i);
+    for (let j = N - 1; j >= 0; j--) l.push(j * S);
     return l;
 }
 const EDGES = edgeList();
@@ -238,13 +244,15 @@ function buildChunk(pl, node) {
     const p = pl.p, R = p.R;
     const step = node.size / N;
     const lim = R / (2 * node.ws / N);
+    let minRaw = Infinity;
     for (let j = 0; j < M; j++) for (let i = 0; i < M; i++) {
         const a = node.x + (i - 1) * step, b = node.y + (j - 1) * step;
         cubeDir(node.face, a, b, _d);
         const k = j * M + i;
         const h = pl.f.raw(_d[0], _d[1], _d[2], lim);
         _raw[k] = h;
-        const s = R + (p.hasSea && h < p.sea ? p.sea : h);
+        if (h < minRaw) minRaw = h;
+        const s = R + h;
         _dir[k * 3] = _d[0]; _dir[k * 3 + 1] = _d[1]; _dir[k * 3 + 2] = _d[2];
         _pos[k * 3] = _d[0] * s; _pos[k * 3 + 1] = _d[1] * s; _pos[k * 3 + 2] = _d[2] * s;
     }
@@ -281,7 +289,7 @@ function buildChunk(pl, node) {
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
     g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-    g.setIndex(chunkIndex());
+    g.setIndex(new THREE.BufferAttribute(chunkIndex(), 1));
     g.computeBoundingSphere();
     const m = new THREE.Mesh(g, pl.mat);
     m.position.set(cx, cy, cz);
@@ -290,13 +298,48 @@ function buildChunk(pl, node) {
     pl.group.add(m);
     node.mesh = m;
     pl.stats.chunks++;
+    // ocean surface for this chunk
+    if (p.hasSea && minRaw < p.sea + 0.5) {
+        const wp = new Float32Array(nv * 3), wd = new Float32Array(nv);
+        const sr = R + p.sea;
+        for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
+            const k = (j + 1) * M + (i + 1), o = j * S + i;
+            wp[o * 3] = _dir[k * 3] * sr - cx; wp[o * 3 + 1] = _dir[k * 3 + 1] * sr - cy; wp[o * 3 + 2] = _dir[k * 3 + 2] * sr - cz;
+            wd[o] = p.sea - _raw[k];
+        }
+        const ws = node.ws * 0.01 + 0.2;
+        for (let e = 0; e < EDGES.length; e++) {
+            const src = EDGES[e], o = S * S + e;
+            const j = Math.floor(src / S), i = src % S;
+            const k = ((j + 1) * M + (i + 1)) * 3;
+            wp[o * 3] = wp[src * 3] - _dir[k] * ws; wp[o * 3 + 1] = wp[src * 3 + 1] - _dir[k + 1] * ws; wp[o * 3 + 2] = wp[src * 3 + 2] - _dir[k + 2] * ws;
+            wd[o] = wd[src];
+        }
+        const wg = new THREE.BufferGeometry();
+        wg.setAttribute('position', new THREE.BufferAttribute(wp, 3));
+        wg.setAttribute('depth', new THREE.BufferAttribute(wd, 1));
+        wg.setIndex(new THREE.BufferAttribute(chunkIndex(), 1));
+        wg.computeBoundingSphere();
+        const w = new THREE.Mesh(wg, pl.wmat);
+        w.position.copy(m.position);
+        w.matrixAutoUpdate = false;
+        w.updateMatrix();
+        w.renderOrder = 1;
+        pl.group.add(w);
+        node.water = w;
+    }
+}
+
+function setVis(n, v) {
+    if (n.mesh) n.mesh.visible = v;
+    if (n.water) n.water.visible = v;
 }
 
 function makeNode(pl, face, x, y, size, depth, key) {
     const n = {
         face, x, y, size, depth, key,
         ws: size * 0.5 * pl.p.R * 1.5708,
-        children: null, mesh: null, dead: false, flora: null,
+        children: null, mesh: null, water: null, dead: false, flora: null, deco: null,
         cpos: new THREE.Vector3()
     };
     cubeDir(face, x + size / 2, y + size / 2, _d);
@@ -304,6 +347,7 @@ function makeNode(pl, face, x, y, size, depth, key) {
     n.cpos.set(_d[0], _d[1], _d[2]).multiplyScalar(pl.p.R + h);
     if (depth === pl.p.bigDepth) spawnFlora(pl, n, 'big');
     if (depth === pl.p.smallDepth) spawnFlora(pl, n, 'small');
+    if (depth === pl.p.grassDepth && pl.p.grass > 0) spawnGrass(pl, n);
     return n;
 }
 
@@ -328,7 +372,16 @@ function disposeNode(pl, n) {
         n.mesh = null;
         pl.stats.chunks--;
     }
+    if (n.water) {
+        pl.group.remove(n.water);
+        n.water.geometry.dispose();
+        n.water = null;
+    }
     if (n.flora) freeFlora(pl, n);
+    if (n.deco) {
+        for (const i of n.deco) poolFree(pl.pools.grass, i);
+        n.deco = null;
+    }
 }
 
 function updateNode(pl, n, cam) {
@@ -341,10 +394,10 @@ function updateNode(pl, n, cam) {
         let ready = true;
         for (const c of n.children) if (!c.mesh) ready = false;
         if (ready) {
-            if (n.mesh) n.mesh.visible = false;
+            setVis(n, false);
             for (const c of n.children) updateNode(pl, c, cam);
         } else {
-            if (n.mesh) n.mesh.visible = true;
+            setVis(n, true);
             for (const c of n.children) hideTree(c);
         }
     } else {
@@ -352,27 +405,31 @@ function updateNode(pl, n, cam) {
             for (const c of n.children) disposeNode(pl, c);
             n.children = null;
         }
-        if (n.mesh) n.mesh.visible = true;
+        setVis(n, true);
     }
 }
 
 function hideTree(n) {
-    if (n.mesh) n.mesh.visible = false;
+    setVis(n, false);
     if (n.children) for (const c of n.children) hideTree(c);
 }
 
 // ---------- flora ----------
-function mergeColored(parts) {
-    // parts: [geometry, THREE.Color]
+function mergeColored(parts, upNormals) {
     const ps = [], ns = [], cs = [];
-    for (const [g0, c] of parts) {
+    for (const [g0, c, c2] of parts) {
         const g = g0.index ? g0.toNonIndexed() : g0;
         g.computeVertexNormals();
         const p = g.attributes.position.array, n = g.attributes.normal.array;
+        let ymin = Infinity, ymax = -Infinity;
+        for (let i = 1; i < p.length; i += 3) { ymin = Math.min(ymin, p[i]); ymax = Math.max(ymax, p[i]); }
         for (let i = 0; i < p.length; i += 3) {
             ps.push(p[i], p[i + 1], p[i + 2]);
-            ns.push(n[i], n[i + 1], n[i + 2]);
-            cs.push(c.r, c.g, c.b);
+            if (upNormals) ns.push(0, 1, 0); else ns.push(n[i], n[i + 1], n[i + 2]);
+            if (c2) {
+                const t = (p[i + 1] - ymin) / Math.max(1e-4, ymax - ymin);
+                cs.push(c.r + (c2.r - c.r) * t, c.g + (c2.g - c.g) * t, c.b + (c2.b - c.b) * t);
+            } else cs.push(c.r, c.g, c.b);
         }
     }
     const g = new THREE.BufferGeometry();
@@ -385,55 +442,103 @@ function mergeColored(parts) {
 
 function treeGeo(p) {
     const c = p.c, s = p.treeStyle;
+    const leaf2 = c.leaf.clone().multiplyScalar(1.35);
     const trunk = new THREE.CylinderGeometry(0.25, 0.45, 4, 5).translate(0, 2, 0);
-    if (s === 0) { // pine
+    if (s === 0) {
         return mergeColored([
             [trunk, c.trunk],
-            [new THREE.ConeGeometry(2.6, 5, 7).translate(0, 5, 0), c.leaf],
-            [new THREE.ConeGeometry(2, 4, 7).translate(0, 7.5, 0), c.leaf]
+            [new THREE.ConeGeometry(2.6, 5, 7).translate(0, 5, 0), c.leaf.clone().multiplyScalar(0.7), c.leaf],
+            [new THREE.ConeGeometry(2, 4, 7).translate(0, 7.5, 0), c.leaf, leaf2]
         ]);
     }
-    if (s === 1) { // blob
+    if (s === 1) {
         return mergeColored([
             [trunk, c.trunk],
-            [new THREE.IcosahedronGeometry(2.8, 0).translate(0, 5.5, 0), c.leaf],
-            [new THREE.IcosahedronGeometry(1.8, 0).translate(1.4, 4.5, 0.6), c.leaf]
+            [new THREE.IcosahedronGeometry(2.8, 1).translate(0, 5.5, 0), c.leaf.clone().multiplyScalar(0.75), leaf2],
+            [new THREE.IcosahedronGeometry(1.8, 1).translate(1.4, 4.5, 0.6), c.leaf.clone().multiplyScalar(0.75), leaf2]
         ]);
     }
-    if (s === 2) { // mushroom
+    if (s === 2) {
         return mergeColored([
             [new THREE.CylinderGeometry(0.5, 0.8, 6, 6).translate(0, 3, 0), c.trunk],
-            [new THREE.SphereGeometry(3.5, 9, 5, 0, Math.PI * 2, 0, Math.PI / 2).translate(0, 5.8, 0), c.leaf],
-            [new THREE.CylinderGeometry(3.4, 3.4, 0.4, 9).translate(0, 5.8, 0), c.plant]
+            [new THREE.SphereGeometry(3.5, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2).translate(0, 5.8, 0), c.leaf, leaf2],
+            [new THREE.CylinderGeometry(3.4, 3.4, 0.4, 12).translate(0, 5.8, 0), c.plant]
         ]);
     }
-    // spikes
     return mergeColored([
-        [new THREE.ConeGeometry(0.9, 9, 5).translate(0, 4.5, 0), c.leaf],
-        [new THREE.ConeGeometry(0.5, 5, 5).rotateZ(0.5).translate(1.2, 3, 0), c.leaf],
+        [new THREE.ConeGeometry(0.9, 9, 6).translate(0, 4.5, 0), c.leaf.clone().multiplyScalar(0.6), leaf2],
+        [new THREE.ConeGeometry(0.5, 5, 5).rotateZ(0.5).translate(1.2, 3, 0), c.leaf, leaf2],
         [new THREE.ConeGeometry(0.5, 4, 5).rotateZ(-0.6).translate(-1, 2.5, 0.3), c.plant]
     ]);
 }
 
+function grassGeo(p) {
+    // a tuft of thin blades; each blade twice (both facings) so normals stay up
+    const base = p.c.low.clone().multiplyScalar(0.5), tip = p.c.low.clone().lerp(new THREE.Color(0.9, 0.95, 0.5), 0.18).multiplyScalar(1.15);
+    const r = rng(p.seed + 5), ps = [], cs = [];
+    for (let i = 0; i < 7; i++) {
+        const a = r() * 6.283, d = r() * 0.3, h = 0.45 + r() * 0.5, w = 0.05 + r() * 0.03;
+        const x = Math.cos(a) * d, z = Math.sin(a) * d, la = r() * 6.283, lean = 0.15 + r() * 0.25;
+        const tx = x + Math.cos(la) * lean, tz = z + Math.sin(la) * lean;
+        const px = -Math.sin(a) * w, pz = Math.cos(a) * w;
+        const v = [[x - px, 0, z - pz], [x + px, 0, z + pz], [tx, h, tz]];
+        for (const order of [[0, 1, 2], [1, 0, 2]]) for (const k of order) {
+            ps.push(...v[k]);
+            const c = k === 2 ? tip : base;
+            cs.push(c.r, c.g, c.b);
+        }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(ps, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(ps.map((_, i) => i % 3 === 1 ? 1 : 0), 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(cs, 3));
+    g.computeBoundingSphere();
+    return g;
+}
+
+function kelpGeo(p) {
+    const parts = [];
+    for (let i = 0; i < 2; i++) {
+        const g = new THREE.PlaneGeometry(0.7, 7, 1, 8).translate(0, 3.5, 0).rotateY(i * Math.PI / 2);
+        const a = g.attributes.position.array;
+        for (let k = 0; k < a.length; k += 3) a[k] += Math.sin(a[k + 1] * 1.3) * 0.25;
+        parts.push([g, p.c.leaf.clone().lerp(new THREE.Color(0.25, 0.2, 0.05), 0.6), p.c.plant.clone().lerp(new THREE.Color(0.5, 0.6, 0.1), 0.4)]);
+    }
+    return mergeColored(parts);
+}
+
+function coralGeo(p) {
+    const c1 = p.coral, c2 = p.coral2;
+    return mergeColored([
+        [new THREE.CylinderGeometry(0.12, 0.2, 1.4, 5).translate(0, 0.7, 0), c1, c2],
+        [new THREE.CylinderGeometry(0.08, 0.15, 1.0, 5).rotateZ(0.7).translate(0.35, 0.8, 0), c1, c2],
+        [new THREE.CylinderGeometry(0.08, 0.15, 1.1, 5).rotateZ(-0.6).rotateY(1).translate(-0.3, 0.9, 0.2), c1, c2],
+        [new THREE.SphereGeometry(0.5, 8, 6).scale(1, 0.6, 1).translate(0.6, 0.2, -0.5), c2, c1],
+        [new THREE.IcosahedronGeometry(0.18, 0).translate(0, 1.45, 0), c2]
+    ]);
+}
+
 function makePools(pl) {
-    const p = pl.p, c = p.c;
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
-    const emat = new THREE.MeshLambertMaterial({ vertexColors: true, emissive: c.crystal, emissiveIntensity: 0.6 });
+    const p = pl.p, c = p.c, atm = pl.atm;
+    const lam = (amt, kelp, extra) => patchWind(new THREE.MeshLambertMaterial(Object.assign({ vertexColors: true }, extra || {})), atm, amt, kelp);
     const defs = {
-        tree: [treeGeo(p), mat, 2500],
-        rock: [mergeColored([[new THREE.DodecahedronGeometry(1.6, 0).scale(1.3, 0.8, 1), c.rock]]), mat, 800],
+        tree: [treeGeo(p), lam(0.0035), 2500],
+        rock: [mergeColored([[new THREE.DodecahedronGeometry(1.6, 0).scale(1.3, 0.8, 1), c.rock]]), lam(0), 800],
         plant: [mergeColored([
-            [new THREE.ConeGeometry(0.5, 1.4, 5).translate(0, 0.7, 0), c.plant],
-            [new THREE.ConeGeometry(0.35, 1.1, 5).rotateZ(0.6).translate(0.4, 0.5, 0), c.plant],
-            [new THREE.ConeGeometry(0.35, 1.0, 5).rotateZ(-0.6).translate(-0.4, 0.5, 0.2), c.plant],
+            [new THREE.ConeGeometry(0.5, 1.4, 5).translate(0, 0.7, 0), c.plant.clone().multiplyScalar(0.6), c.plant],
+            [new THREE.ConeGeometry(0.35, 1.1, 5).rotateZ(0.6).translate(0.4, 0.5, 0), c.plant.clone().multiplyScalar(0.6), c.plant],
+            [new THREE.ConeGeometry(0.35, 1.0, 5).rotateZ(-0.6).translate(-0.4, 0.5, 0.2), c.plant.clone().multiplyScalar(0.6), c.plant],
             [new THREE.SphereGeometry(0.22, 6, 4).translate(0, 1.45, 0), c.crystal]
-        ]), mat, 2500],
+        ]), lam(0.06), 2500],
         crystal: [mergeColored([
             [new THREE.OctahedronGeometry(0.6, 0).scale(0.6, 2.2, 0.6).translate(0, 1, 0), c.crystal],
             [new THREE.OctahedronGeometry(0.45, 0).scale(0.6, 2, 0.6).rotateZ(0.5).translate(0.5, 0.7, 0), c.crystal],
             [new THREE.OctahedronGeometry(0.4, 0).scale(0.6, 1.8, 0.6).rotateX(-0.5).translate(0, 0.6, 0.5), c.crystal]
-        ]), emat, 600],
-        pebble: [mergeColored([[new THREE.IcosahedronGeometry(0.5, 0).scale(1.2, 0.6, 1), c.rock]]), mat, 2500]
+        ]), lam(0, false, { emissive: c.crystal, emissiveIntensity: 0.7 }), 600],
+        pebble: [mergeColored([[new THREE.IcosahedronGeometry(0.5, 0).scale(1.2, 0.6, 1), c.rock]]), lam(0), 2500],
+        grass: [grassGeo(p), lam(0.35), 9000],
+        kelp: [kelpGeo(p), lam(0.012, true, { side: THREE.DoubleSide }), 1200],
+        coral: [coralGeo(p), lam(0, false, { emissive: p.coral, emissiveIntensity: 0.15 }), 1200]
     };
     pl.pools = {};
     for (const k in defs) {
@@ -470,10 +575,33 @@ function poolFree(pool, i) {
 export const YIELD = {
     tree: { res: 'carbon', amt: 30, hp: 3, r: 1.6, h: 5 },
     plant: { res: 'carbon', amt: 12, hp: 1, r: 0.9, h: 0.8 },
+    kelp: { res: 'carbon', amt: 14, hp: 1, r: 0.8, h: 3 },
     rock: { res: 'ferrite', amt: 25, hp: 2.5, r: 2, h: 0.8 },
     pebble: { res: 'ferrite', amt: 6, hp: 0.6, r: 0.7, h: 0.3 },
+    coral: { res: 'ferrite', amt: 14, hp: 1.2, r: 0.9, h: 0.8 },
     crystal: { res: 'dihydrogen', amt: 20, hp: 1.5, r: 1, h: 1 }
 };
+
+function place(pl, pool, idx, dir, h, s, rot, r) {
+    _v.set(dir[0], dir[1], dir[2]);
+    _q.setFromUnitVectors(_Y, _v);
+    _q2.setFromAxisAngle(_Y, rot);
+    _q.multiply(_q2);
+    _s.set(s, s, s);
+    const pos = _v.clone().multiplyScalar(pl.p.R + h - 0.15);
+    _m4.compose(pos, _q, _s);
+    pool.im.setMatrixAt(idx, _m4);
+    _col.setRGB(0.85 + r() * 0.3, 0.85 + r() * 0.3, 0.85 + r() * 0.3);
+    pool.im.setColorAt(idx, _col);
+    return pos;
+}
+
+function touch(pl) {
+    for (const k in pl.pools) {
+        pl.pools[k].im.instanceMatrix.needsUpdate = true;
+        if (pl.pools[k].im.instanceColor) pl.pools[k].im.instanceColor.needsUpdate = true;
+    }
+}
 
 function spawnFlora(pl, node, kind) {
     const p = pl.p;
@@ -488,12 +616,20 @@ function spawnFlora(pl, node, kind) {
         const roll = r(), sc = 0.7 + r() * 0.7, rot = r() * 6.283;
         cubeDir(node.face, a, b, _d);
         const h = pl.f.raw(_d[0], _d[1], _d[2]);
-        if (p.hasSea && h < p.sea + 0.5) continue;
+        const under = p.hasSea && h < p.sea - 1.2;
+        if (p.hasSea && !under && h < p.sea + 0.5) continue;
         const t = (h - p.sea) / p.relief;
         if (t > 0.6) continue;
-        const mask = pl.f.detail(_d[0] * 0.2, _d[1] * 0.2, _d[2] * 0.2);
         let type;
-        if (kind === 'big') {
+        if (under) {
+            if (kind === 'big') { if (roll < 0.3) type = 'rock'; else continue; }
+            else if (roll < 0.38) type = 'kelp';
+            else if (roll < 0.62) type = 'coral';
+            else if (roll < 0.78) type = 'pebble';
+            else if (roll < 0.86) type = 'crystal';
+            else continue;
+        } else if (kind === 'big') {
+            const mask = pl.f.detail(_d[0] * 0.2, _d[1] * 0.2, _d[2] * 0.2);
             if (roll < 0.7) { if (mask < -0.15) continue; type = 'tree'; }
             else type = 'rock';
         } else {
@@ -507,27 +643,40 @@ function spawnFlora(pl, node, kind) {
         const pool = pl.pools[type];
         const idx = poolAlloc(pool);
         if (idx < 0) continue;
-        _v.set(_d[0], _d[1], _d[2]);
-        _q.setFromUnitVectors(_Y, _v);
-        _q2.setFromAxisAngle(_Y, rot);
-        _q.multiply(_q2);
-        const s = type === 'tree' ? sc * (0.9 + p.flora * 0.3) : sc;
-        _s.set(s, s, s);
-        const pos = _v.clone().multiplyScalar(p.R + h - 0.15);
-        _m4.compose(pos, _q, _s);
-        pool.im.setMatrixAt(idx, _m4);
-        _col.setRGB(0.85 + r() * 0.3, 0.85 + r() * 0.3, 0.85 + r() * 0.3);
-        pool.im.setColorAt(idx, _col);
+        const s = type === 'tree' ? sc * (0.9 + p.flora * 0.3) : type === 'kelp' ? sc * 1.2 : sc;
+        const pos = place(pl, pool, idx, _d, h, s, rot, r);
         const y = YIELD[type];
         const it = { key, type, pool, idx, pos, up: _v.clone(), r: y.r * s, hp: y.hp, hpMax: y.hp, s, h: y.h * s };
         items.push(it);
         pl.items.set(key, it);
     }
-    for (const k in pl.pools) {
-        pl.pools[k].im.instanceMatrix.needsUpdate = true;
-        if (pl.pools[k].im.instanceColor) pl.pools[k].im.instanceColor.needsUpdate = true;
-    }
+    touch(pl);
     node.flora = items;
+}
+
+function spawnGrass(pl, node) {
+    const p = pl.p;
+    if (!pl.pools) makePools(pl);
+    const r = rng(hash(p.seed + ':' + node.key + 'g'));
+    const count = Math.min(260, Math.round(node.ws * node.ws * p.grass));
+    const pool = pl.pools.grass, list = [];
+    for (let k = 0; k < count; k++) {
+        const a = node.x + r() * node.size, b = node.y + r() * node.size;
+        const sc = 0.6 + r() * 0.9, rot = r() * 6.283;
+        cubeDir(node.face, a, b, _d);
+        const h = pl.f.raw(_d[0], _d[1], _d[2]);
+        if (p.hasSea && h < p.sea + 0.6) continue;
+        const t = (h - p.sea) / p.relief;
+        if (t > 0.42) continue;
+        const mask = pl.f.detail(_d[0] * 0.5, _d[1] * 0.5, _d[2] * 0.5);
+        if (mask < -0.55) continue;
+        const idx = poolAlloc(pool);
+        if (idx < 0) break;
+        place(pl, pool, idx, _d, h + 0.1, sc, rot, r);
+        list.push(idx);
+    }
+    touch(pl);
+    node.deco = list;
 }
 
 function freeFlora(pl, node) {
@@ -548,7 +697,6 @@ export function removeItem(pl, it) {
 }
 
 export function shrinkItem(it, frac) {
-    // visual feedback while mining
     const s = it.s * Math.max(0.3, frac);
     _q.setFromUnitVectors(_Y, it.up);
     _s.set(s, s, s);
@@ -557,32 +705,57 @@ export function shrinkItem(it, frac) {
     it.pool.im.instanceMatrix.needsUpdate = true;
 }
 
-// ---------- atmosphere ----------
-function atmoMesh(p) {
+// ---------- rings ----------
+function ringMesh(pl) {
+    const p = pl.p, r = rng(p.seed + 77);
+    const W = 512, c = document.createElement('canvas');
+    c.width = W; c.height = 1;
+    const x = c.getContext('2d'), img = x.createImageData(W, 1);
+    const h1 = r(), h2 = r();
+    const n = simplex(p.seed + 78);
+    for (let i = 0; i < W; i++) {
+        const t = i / W;
+        const band = 0.55 + 0.35 * n(t * 22, 0.5, 0) + 0.1 * n(t * 70, 1.5, 0);
+        const gap = t > 0.55 && t < 0.6 ? 0.1 : 1;
+        const edge = Math.min(1, t * 8, (1 - t) * 6);
+        const col = new THREE.Color().setHSL(t < 0.5 ? h1 : h2, 0.25, 0.45 + band * 0.3);
+        img.data[i * 4] = col.r * 255; img.data[i * 4 + 1] = col.g * 255; img.data[i * 4 + 2] = col.b * 255;
+        img.data[i * 4 + 3] = Math.max(0, Math.min(255, band * 230 * gap * edge));
+    }
+    x.putImageData(img, 0, 0);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const inner = p.R * 1.55, outer = p.R * 2.7;
     const mat = new THREE.ShaderMaterial({
-        uniforms: { color: { value: p.c.atmo.clone() }, sunPos: { value: new THREE.Vector3() } },
+        uniforms: { uBands: { value: tex }, uIn: { value: inner }, uOut: { value: outer }, uR: { value: p.R }, uSun: pl.atm.u.uSun, uCenter: pl.atm.u.uCenter },
         vertexShader: `
-            varying vec3 vN; varying vec3 vV; varying vec3 vW;
+            varying vec3 vL; varying vec3 vP;
             void main() {
+                vL = position;
                 vec4 wp = modelMatrix * vec4(position, 1.0);
-                vW = wp.xyz;
-                vN = normalize(mat3(modelMatrix) * normal);
-                vV = normalize(cameraPosition - wp.xyz);
+                vP = wp.xyz;
                 gl_Position = projectionMatrix * viewMatrix * wp;
             }`,
         fragmentShader: `
-            uniform vec3 color; uniform vec3 sunPos;
-            varying vec3 vN; varying vec3 vV; varying vec3 vW;
+            uniform sampler2D uBands; uniform float uIn, uOut, uR; uniform vec3 uSun, uCenter;
+            varying vec3 vL; varying vec3 vP;
             void main() {
-                float f = 1.0 - max(dot(vN, vV), 0.0);
-                float rim = pow(f, 2.5);
-                float lit = clamp(dot(vN, normalize(sunPos - vW)) * 0.8 + 0.35, 0.0, 1.0);
-                gl_FragColor = vec4(color * rim * lit * 1.4, 1.0);
+                float t = (length(vL.xy) - uIn) / (uOut - uIn);
+                if (t < 0.0 || t > 1.0) discard;
+                vec4 b = texture2D(uBands, vec2(t, 0.5));
+                vec3 P = vP - uCenter;
+                float bb = dot(P, uSun), cc = dot(P, P) - uR * uR;
+                float sh = (bb < 0.0 && bb * bb - cc > 0.0) ? 0.12 : 1.0;
+                gl_FragColor = vec4(b.rgb * sh * 0.8, b.a * 0.55);
+                #include <tonemapping_fragment>
+                #include <colorspace_fragment>
             }`,
-        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false
+        side: THREE.DoubleSide, transparent: true, depthWrite: false
     });
-    const m = new THREE.Mesh(new THREE.SphereGeometry(p.R * 1.1, 64, 32), mat);
-    m.renderOrder = 2;
+    const m = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 160, 1), mat);
+    m.rotation.set(Math.PI / 2 + (r() - 0.5) * 0.9, (r() - 0.5) * 0.5, 0);
+    m.renderOrder = 1;
+    m.frustumCulled = false;
     return m;
 }
 
@@ -593,31 +766,36 @@ export function makePlanet(seed, center, forceType) {
         p, seed, name: p.name, center: center.clone(),
         group: new THREE.Group(),
         f: heightFns(p),
-        mat: new THREE.MeshLambertMaterial({ vertexColors: true }),
         roots: [], queue: [], items: new Map(), mined: new Set(),
         pools: null, stats: { chunks: 0 }, visited: false
     };
+    pl.atm = makeAtm(p, center);
+    pl.mat = terrainMaterial(pl.atm);
+    pl.wmat = waterMaterial(pl.atm, p);
     pl.group.position.copy(center);
     for (let f = 0; f < 6; f++) {
         const n = makeNode(pl, f, -1, -1, 2, 0, 'f' + f);
         buildChunk(pl, n);
         pl.roots.push(n);
     }
-    pl.atmo = atmoMesh(p);
-    pl.group.add(pl.atmo);
+    pl.sky = skyMesh(pl.atm);
+    pl.group.add(pl.sky);
+    pl.clouds = cloudMesh(pl, pl.atm);
+    if (pl.clouds) pl.group.add(pl.clouds);
+    if (p.ring) { pl.ring = ringMesh(pl); pl.group.add(pl.ring); }
     return pl;
 }
 
-const _cam = new THREE.Vector3();
-export function updatePlanet(pl, camWorld, budget) {
+const _cam = new THREE.Vector3(), _e = new THREE.Euler();
+export function updatePlanet(pl, camWorld, budget, time) {
     _cam.copy(camWorld).sub(pl.center);
-    const dist = _cam.length();
-    if (dist < pl.p.R * 8) {
-        for (const n of pl.roots) updateNode(pl, n, _cam);
-    } else if (pl.roots.some(n => n.children)) {
-        for (const n of pl.roots) updateNode(pl, n, _cam);
+    pl.atm.u.uCam.value.copy(_cam);
+    pl.sky.material = _cam.length() > pl.atm.outer * 1.01 ? pl.sky.userData.matF : pl.sky.userData.matV;
+    if (pl.clouds) {
+        _e.set(0, time * pl.clouds.userData.spin, 0);
+        pl.clouds.userData.rot.value.setFromMatrix4(_m4.makeRotationFromEuler(_e));
     }
-    // build queued chunks, most needed first
+    for (const n of pl.roots) updateNode(pl, n, _cam);
     let built = 0;
     while (built < budget && pl.queue.length) {
         let best = -1, bs = Infinity;
@@ -630,26 +808,22 @@ export function updatePlanet(pl, camWorld, budget) {
         if (best < 0) break;
         const n = pl.queue.splice(best, 1)[0];
         buildChunk(pl, n);
-        n.mesh.visible = false;
+        setVis(n, false);
         built++;
     }
-    pl.atmo.visible = dist > pl.p.R * 1.1;
     return built;
 }
 
 export function disposePlanet(pl) {
     for (const n of pl.roots) disposeNode(pl, n);
-    if (pl.pools) for (const k in pl.pools) {
-        pl.pools[k].im.geometry.dispose();
-        pl.pools[k].im.dispose();
-    }
-    pl.atmo.geometry.dispose();
-    pl.atmo.material.dispose();
-    pl.mat.dispose();
+    pl.group.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material && o.material.dispose) o.material.dispose();
+    });
     pl.group.removeFromParent();
 }
 
-// surface height (meters above R) for a world position
+// surface height (meters above R); ocean counts as the surface
 const _u = new THREE.Vector3();
 export function groundAt(pl, worldPos) {
     _u.copy(worldPos).sub(pl.center).normalize();
@@ -661,4 +835,12 @@ export function altitude(pl, worldPos) {
     const r = _u.length();
     _u.divideScalar(r);
     return r - pl.p.R - pl.f.height(_u.x, _u.y, _u.z);
+}
+
+// height above the solid ground (sea floor included)
+export function altitudeRaw(pl, worldPos) {
+    _u.copy(worldPos).sub(pl.center);
+    const r = _u.length();
+    _u.divideScalar(r);
+    return r - pl.p.R - pl.f.raw(_u.x, _u.y, _u.z);
 }

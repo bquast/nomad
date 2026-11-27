@@ -1,6 +1,7 @@
 // fauna.js - procedural creature species and wandering herds near the player
 import * as THREE from './three.module.js';
 import { rng, makeName } from './noise.js';
+import { patchTint } from './atmosphere.js';
 
 const MAX = 7;
 
@@ -64,7 +65,7 @@ function makeSpecies(r, pl, i) {
         name: makeName(r, 2) + ' ' + ['Grazer', 'Hopper', 'Strider', 'Beast', 'Crawler', 'Runner'][Math.floor(r() * 6)],
         size, hip, body, legA: merge(legA), legB: merge(legB),
         speed: 1.2 + r() * 2.5 / Math.sqrt(size), timid: r() < 0.6,
-        mat: new THREE.MeshLambertMaterial({ vertexColors: true })
+        mat: patchTint(new THREE.MeshLambertMaterial({ vertexColors: true }))
     };
 }
 

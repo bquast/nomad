@@ -1,6 +1,7 @@
 // world.js - star system (sun, stars, planets, asteroids) and the player ship model
 import * as THREE from './three.module.js';
-import { rng, hash, makeName } from './noise.js';
+import { rng, hash, makeName, simplex } from './noise.js';
+import { cubeFromFn } from './atmosphere.js';
 import { makePlanet, disposePlanet } from './planet.js';
 
 function glowTexture(inner, outer) {
@@ -55,7 +56,7 @@ export function makeSystem(scene, seed, first) {
     glow.scale.set(34000, 34000, 1);
     sys.group.add(glow);
     sys.sunMeshes = [sun, glow];
-    const light = new THREE.PointLight(sunCol.clone().lerp(new THREE.Color(1, 1, 1), 0.6), 3.2, 0, 0);
+    const light = new THREE.PointLight(sunCol.clone().lerp(new THREE.Color(1, 1, 1), 0.7), 2.5, 0, 0);
     sys.group.add(light);
     sys.light = light;
     sys.ambient = new THREE.AmbientLight(0xffffff, 0.35);
@@ -63,6 +64,7 @@ export function makeSystem(scene, seed, first) {
     sys.stars = makeStars(r);
     sys.group.add(sys.stars);
     sys.bg = new THREE.Color().setHSL(r(), 0.45, 0.012);
+    sys.nebula = nebula(seed, r);
 
     const count = 3 + Math.floor(r() * 3);
     for (let i = 0; i < count; i++) {
@@ -97,6 +99,62 @@ export function makeSystem(scene, seed, first) {
     sys.group.add(im);
     sys.asteroids = { im, list: ast };
     return sys;
+}
+
+function nebula(seed, r) {
+    const n = simplex(seed + 1), w = simplex(seed + 2);
+    const ca = new THREE.Color().setHSL(r(), 0.7, 0.5), cb = new THREE.Color().setHSL(r(), 0.8, 0.55);
+    const fbm = (x, y, z, o) => { let v = 0, a = 0.5, f = 1; for (let i = 0; i < o; i++) { v += a * n(x * f, y * f, z * f); a *= 0.5; f *= 2.05; } return v; };
+    const sm = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+    const t = cubeFromFn(128, (d, o) => {
+        const wx = w(d.x * 1.3, d.y * 1.3, d.z * 1.3) * 0.9;
+        const v = fbm(d.x * 1.4 + wx, d.y * 1.4 - wx, d.z * 1.4 + wx * 0.5, 5) * 0.5 + 0.5;
+        const v2 = fbm(d.x * 3.3 - wx, d.y * 3.3, d.z * 3.3 + wx, 4) * 0.5 + 0.5;
+        const dust = sm(0.55, 0.75, fbm(d.x * 5 + 9, d.y * 5, d.z * 5, 3) * 0.5 + 0.5);
+        const band = Math.exp(-Math.pow(d.y * 3 + wx * 0.8, 2));
+        const a = sm(0.42, 0.85, v) * (0.35 + 0.65 * band), b = Math.pow(sm(0.5, 0.95, v2), 2);
+        const k = 1 - dust * 0.7;
+        o[0] = Math.min(255, (ca.r * a * 0.4 + cb.r * b * 0.32 + band * 0.05) * k * 255);
+        o[1] = Math.min(255, (ca.g * a * 0.4 + cb.g * b * 0.32 + band * 0.045) * k * 255);
+        o[2] = Math.min(255, (ca.b * a * 0.4 + cb.b * b * 0.32 + band * 0.06) * k * 255);
+        o[3] = 255;
+    });
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+}
+
+export function makeStreaks(scene) {
+    const n = 260, pos = new Float32Array(n * 6);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const m = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xcfe8ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+    m.frustumCulled = false;
+    scene.add(m);
+    const off = [];
+    for (let i = 0; i < n; i++) off.push(new THREE.Vector3((Math.random() - 0.5) * 240, (Math.random() - 0.5) * 240, (Math.random() - 0.5) * 240));
+    return { m, off };
+}
+
+const _sv = new THREE.Vector3();
+export function updateStreaks(st, eye, vel, show, dt) {
+    const sp = vel.length();
+    const k = show ? Math.min(1, Math.max(0, (sp - 120) / 600)) : 0;
+    st.m.material.opacity += (k * 0.8 - st.m.material.opacity) * Math.min(1, dt * 4);
+    st.m.visible = st.m.material.opacity > 0.01;
+    if (!st.m.visible) return;
+    st.m.position.copy(eye);
+    const a = st.m.geometry.attributes.position.array;
+    const len = Math.min(60, sp * 0.02);
+    _sv.copy(vel).normalize();
+    const mv = Math.min(sp * dt, 200);
+    for (let i = 0; i < st.off.length; i++) {
+        const o = st.off[i];
+        o.addScaledVector(_sv, -mv);
+        for (const ax of ['x', 'y', 'z']) { if (o[ax] < -120) o[ax] += 240; else if (o[ax] > 120) o[ax] -= 240; }
+        a[i * 6] = o.x; a[i * 6 + 1] = o.y; a[i * 6 + 2] = o.z;
+        a[i * 6 + 3] = o.x - _sv.x * len; a[i * 6 + 4] = o.y - _sv.y * len; a[i * 6 + 5] = o.z - _sv.z * len;
+    }
+    st.m.geometry.attributes.position.needsUpdate = true;
 }
 
 export function killAsteroid(sys, a) {

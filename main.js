@@ -1,7 +1,10 @@
 // main.js - Nomad: game state, on-foot and ship logic, VR setup, main loop
 import * as THREE from './three.module.js';
-import { makeSystem, disposeSystem, nearestPlanet, makeShip, killAsteroid, systemSeed } from './world.js';
-import { updatePlanet, altitude, removeItem, shrinkItem, YIELD } from './planet.js';
+import { makeSystem, disposeSystem, nearestPlanet, makeShip, killAsteroid, systemSeed, makeStreaks, updateStreaks } from './world.js';
+import { updatePlanet, altitude, altitudeRaw, removeItem, shrinkItem, YIELD } from './planet.js';
+import { SHARED, skyColor, sunTrans, patchTint } from './atmosphere.js';
+import { makeSea, updateSea } from './water.js';
+import { makeCockpit, drawCockpit } from './cockpit.js';
 import { makeFauna, updateFauna, creaturesNear, speciesFor } from './fauna.js';
 import { makeHud, drawHud, hudHit, HUD_W, HUD_H } from './hud.js';
 import { makeInput, readDesktop, readXR, endFrame } from './input.js';
@@ -12,11 +15,13 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0);
-scene.fog = new THREE.Fog(0x000000, 1e6, 1e7);
+scene.fog = new THREE.FogExp2(0x000000, 0);
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 400000);
 const rig = new THREE.Group();
 rig.add(camera);
@@ -38,7 +43,8 @@ const G = {
     life: 1, jet: 1, fuel: 1,
     foot: { pos: V(), vel: V(), q: new THREE.Quaternion(), pitch: 0, onGround: false },
     ship: null,
-    opts: { vignette: true, snap: true, assist: true, hand: true },
+    opts: { vignette: true, snap: true, assist: true, hand: true, cockpit: false },
+    under: false, swim: false, eyeY: 1.25,
     menu: false, sel: 0, msgs: [], scanT: 0, warpT: 0, warped: false,
     species: new Set(), planets: new Set(),
     vr: false, vig: 0, hudT: 0, saveT: 30, fireT: 0, warnT: 0, time: 0
@@ -51,7 +57,12 @@ document.body.appendChild(hud.canvas);
 
 // ---------- ship ----------
 const shipModel = makeShip();
+shipModel.group.traverse(o => { if (o.material && o.material.type === 'MeshLambertMaterial' && !o.material.transparent) patchTint(o.material); });
 scene.add(shipModel.group);
+const cockpit = makeCockpit();
+rig.add(cockpit.group);
+const sea = makeSea(scene);
+const streaks = makeStreaks(scene);
 G.ship = { m: shipModel, pos: V(), q: new THREE.Quaternion(), speed: 0, landed: true, landing: null, lift: 0, pulse: false };
 
 // ---------- effects ----------
@@ -92,7 +103,7 @@ fade.visible = false;
 camera.add(fade);
 
 // scan markers
-const ICONS = { crystal: ['H', '#5fe8ff'], rock: ['Fe', '#ff9f5a'], pebble: ['Fe', '#ff9f5a'], plant: ['C', '#8cff7a'], tree: ['C', '#8cff7a'], fauna: ['?', '#ffe36a'] };
+const ICONS = { crystal: ['H', '#5fe8ff'], rock: ['Fe', '#ff9f5a'], pebble: ['Fe', '#ff9f5a'], coral: ['Fe', '#ff9f5a'], plant: ['C', '#8cff7a'], kelp: ['C', '#8cff7a'], tree: ['C', '#8cff7a'], fauna: ['?', '#ffe36a'] };
 const iconMats = {};
 for (const k in ICONS) {
     const c = document.createElement('canvas');
@@ -162,7 +173,7 @@ function refine(pl, maxBuilds) {
     const eye = eyePos(V());
     let n = 0;
     for (let i = 0; i < 60 && n < maxBuilds; i++) {
-        const b = updatePlanet(pl, eye, 40);
+        const b = updatePlanet(pl, eye, 40, G.time);
         n += b;
         if (b === 0 && pl.queue.length === 0) break;
     }
@@ -171,10 +182,6 @@ function refine(pl, maxBuilds) {
 function setCurrentPlanet(pl) {
     if (G.pl === pl) return;
     G.pl = pl;
-    for (const p of G.sys.planets) {
-        p.mat.fog = p === pl;
-        p.mat.needsUpdate = true;
-    }
 }
 
 // ---------- system / spawn ----------
@@ -182,7 +189,7 @@ function loadSystem(n) {
     if (G.sys) disposeSystem(G.sys);
     G.sysN = n;
     G.sys = makeSystem(scene, systemSeed(n), n === 0);
-    for (const pl of G.sys.planets) pl.atmo.material.uniforms.sunPos.value.copy(G.sys.sunPos);
+    scene.background = G.sys.nebula;
     G.pl = null;
     setCurrentPlanet(G.sys.planets[0]);
 }
@@ -252,9 +259,10 @@ function placeRig() {
         }
     } else {
         const S = G.ship;
-        if (G.vr) {
+        if (G.vr || G.opts.cockpit) {
             rig.position.copy(S.m.seat).applyQuaternion(S.q).add(S.pos);
             rig.quaternion.copy(S.q);
+            if (!G.vr) { camera.position.set(0, G.eyeY, 0); camera.rotation.set(0, 0, 0); }
         } else {
             rig.position.set(0, 4.2, 17).applyQuaternion(S.q).add(S.pos);
             rig.quaternion.copy(S.q).multiply(_q1.setFromAxisAngle(X, -0.1));
@@ -283,10 +291,10 @@ function rayItems(pl, o, d, maxT) {
     return [best, bt];
 }
 
-function rayTerrain(pl, o, d, maxT, step) {
+function rayTerrain(pl, o, d, maxT, step, raw) {
     for (let t = step; t < maxT; t += step) {
         _v2.copy(o).addScaledVector(d, t);
-        if (altitude(pl, _v2) < 0) return t;
+        if ((raw ? altitudeRaw(pl, _v2) : altitude(pl, _v2)) < 0) return t;
     }
     return maxT;
 }
@@ -325,23 +333,43 @@ function updateFoot(I, dt) {
     fwd.normalize();
     const right = V().crossVectors(fwd, up);
     const raw = pl.f.raw(up.x, up.y, up.z);
-    const inWater = p.hasSea && raw < p.sea;
-    let speed = I.sprint ? 9 : 5;
-    if (inWater) speed *= 0.5;
-    const tgt = V().addScaledVector(fwd, I.my).addScaledVector(right, I.mx);
-    if (tgt.lengthSq() > 1) tgt.normalize();
-    tgt.multiplyScalar(speed);
-    let vr = F.vel.dot(up);
-    const tan = F.vel.clone().addScaledVector(up, -vr);
-    tan.lerp(tgt, Math.min(1, dt * (F.onGround ? 10 : 1.5)));
-    vr -= p.gravity * dt;
-    if (I.jet && G.jet > 0) {
-        vr += (p.gravity + 9) * dt;
-        G.jet = Math.max(0, G.jet - dt * 0.33);
-        if (I.my > 0) tan.addScaledVector(fwd, 6 * dt);
-    } else if (F.onGround) G.jet = Math.min(1, G.jet + dt * 0.5);
-    F.vel.copy(tan).addScaledVector(up, vr);
-    F.pos.addScaledVector(F.vel, dt);
+    const seaR = p.R + p.sea;
+    const depthFeet = p.hasSea ? seaR - F.pos.distanceTo(pl.center) : -1;
+    G.swim = p.hasSea && depthFeet > 1.2 && raw < p.sea - 1.3;
+    let tan;
+    if (G.swim) {
+        const look = eyeDir(V());
+        const tgt = V().addScaledVector(look, I.my).addScaledVector(right, I.mx);
+        if (tgt.lengthSq() > 1) tgt.normalize();
+        tgt.multiplyScalar(I.sprint ? 6 : 3.5);
+        if (I.jet) tgt.addScaledVector(up, 3);
+        // float at the surface unless diving
+        if (tgt.dot(up) > -0.4 && depthFeet < 2.6) tgt.addScaledVector(up, (depthFeet - 1.55) * 2.5);
+        else tgt.addScaledVector(up, -0.2);
+        F.vel.lerp(tgt, Math.min(1, dt * 3));
+        F.pos.addScaledVector(F.vel, dt);
+        const d2 = seaR - F.pos.distanceTo(pl.center);
+        if (d2 < 1.45) F.pos.copy(upAt(pl, F.pos, _v1)).multiplyScalar(seaR - 1.45).add(pl.center);
+        tan = F.vel.clone();
+        G.jet = Math.min(1, G.jet + dt * 0.5);
+    } else {
+        let speed = I.sprint ? 9 : 5;
+        if (depthFeet > 0.3) speed *= 0.55;
+        const tgt = V().addScaledVector(fwd, I.my).addScaledVector(right, I.mx);
+        if (tgt.lengthSq() > 1) tgt.normalize();
+        tgt.multiplyScalar(speed);
+        let vr = F.vel.dot(up);
+        tan = F.vel.clone().addScaledVector(up, -vr);
+        tan.lerp(tgt, Math.min(1, dt * (F.onGround ? 10 : 1.5)));
+        vr -= p.gravity * (depthFeet > 0.5 ? 0.4 : 1) * dt;
+        if (I.jet && G.jet > 0) {
+            vr += (p.gravity + 9) * dt;
+            G.jet = Math.max(0, G.jet - dt * 0.33);
+            if (I.my > 0) tan.addScaledVector(fwd, 6 * dt);
+        } else if (F.onGround) G.jet = Math.min(1, G.jet + dt * 0.5);
+        F.vel.copy(tan).addScaledVector(up, vr);
+        F.pos.addScaledVector(F.vel, dt);
+    }
     // push out of trees and rocks
     const lx = F.pos.x - pl.center.x, ly = F.pos.y - pl.center.y, lz = F.pos.z - pl.center.z;
     for (const it of pl.items.values()) {
@@ -360,7 +388,7 @@ function updateFoot(I, dt) {
     // ground
     const nu = upAt(pl, F.pos, V());
     const dist = F.pos.distanceTo(pl.center);
-    const gr = pl.f.height(nu.x, nu.y, nu.z) - (inWater ? 0.6 : 0);
+    const gr = pl.f.raw(nu.x, nu.y, nu.z);
     F.onGround = false;
     if (dist - p.R <= gr + 0.01) {
         F.pos.copy(nu).multiplyScalar(p.R + gr).add(pl.center);
@@ -373,8 +401,8 @@ function updateFoot(I, dt) {
         msg('Planet discovered: ' + pl.name + ' (+1000 units)');
     }
     // life support
-    G.life = Math.max(0, G.life - dt / (300 / p.lifeDrain));
-    if (G.life < 0.2 && G.warnT <= 0) { msg('Life support low: recharge with Carbon (menu)'); G.warnT = 20; }
+    G.life = Math.max(0, G.life - dt / (300 / p.lifeDrain) * (G.under ? 4 : 1));
+    if (G.life < 0.2 && G.warnT <= 0) { msg(G.under ? 'Oxygen low: swim up or recharge with Carbon' : 'Life support low: recharge with Carbon (menu)'); G.warnT = 20; }
     if (G.life <= 0) {
         msg('Life support failed. You wake up at your ship.');
         G.life = 0.5;
@@ -389,7 +417,7 @@ function updateFoot(I, dt) {
     hitGlow.visible = false;
     if (I.fire && !G.pointerOnHud && !G.menuBlock) {
         const [it, t] = rayItems(pl, o, d, 35);
-        const tt = it ? t : rayTerrain(pl, o, d, 35, 0.75);
+        const tt = it ? t : rayTerrain(pl, o, d, 35, 0.75, true);
         const end = o.clone().addScaledVector(d, tt);
         const from = o.clone().addScaledVector(d, 0.4);
         if (!G.vr) from.addScaledVector(V().crossVectors(d, up).normalize(), 0.25).addScaledVector(up, -0.25);
@@ -500,6 +528,7 @@ function updateShip(I, dt) {
         // speed
         let max = inAtmo ? 160 : 450;
         if (I.boost) max *= 2.5;
+        S.boost = I.boost;
         let tgt = I.throttle > 0 ? I.throttle * max : I.throttle * 40;
         // pulse drive: only far from planets
         let clear = true;
@@ -574,6 +603,18 @@ function updateShip(I, dt) {
     const g = S.landed ? 0.05 : 0.3 + Math.min(1.5, S.speed / 300);
     S.m.glow.scale.set(1, 1, g);
     return { ang, accel: Math.abs(S.speed - (S.prevSpeed || 0)) / Math.max(dt, 1e-3) };
+}
+
+function cockpitInfo() {
+    const S = G.ship, pl = G.pl;
+    const up = upAt(pl, S.pos, V());
+    const planets = G.sys.planets.filter(q => q !== pl || S.pos.distanceTo(q.center) > q.atm.outer)
+        .map(q => ({ name: q.name, pos: q.center, dist: S.pos.distanceTo(q.center) - q.p.R }));
+    return {
+        q: S.q, up, speed: S.speed, alt: altitude(pl, S.pos), throttle: Math.min(1, S.speed / (S.pulse ? 6000 : 450)),
+        pulse: S.pulse, boost: S.boost, assist: G.opts.assist && S.pos.distanceTo(pl.center) < pl.p.R * 1.3,
+        landed: S.landed, inAtmo: S.pos.distanceTo(pl.center) < pl.atm.outer * 1.05, planets, shipPos: S.pos
+    };
 }
 
 // ---------- scanner ----------
@@ -711,7 +752,7 @@ function hudInfo() {
     if (G.mode === 'foot') {
         title = pl.name;
         sub = pl.p.type.charAt(0).toUpperCase() + pl.p.type.slice(1) + ' planet  ·  gravity ' + (pl.p.gravity / 9.8).toFixed(1) + ' g  ·  ' + G.sys.name;
-        bars = [{ label: 'Life support', v: G.life, color: '#6fe08a' }, { label: 'Jetpack', v: G.jet, color: '#5ab8ff' }];
+        bars = [{ label: G.under ? 'Oxygen' : 'Life support', v: G.life, color: G.under ? '#7fd8ff' : '#6fe08a' }, { label: 'Jetpack', v: G.jet, color: '#5ab8ff' }];
     } else {
         const a = altitude(pl, S.pos);
         const far = a > pl.p.R * 0.6;
@@ -759,9 +800,10 @@ const raycaster = new THREE.Raycaster();
 const hudDefault = { pos: new THREE.Vector3(0, 1.0, -1.5) };
 
 function placeHudVR() {
-    rig.updateMatrixWorld();
     hud.mesh.position.copy(hudDefault.pos);
-    hud.mesh.lookAt(rig.localToWorld(V().set(0, 1.6, 0)));
+    // face the head, in rig space, with the rig's up (the planet's up)
+    _m1.lookAt(V().set(0, 1.6, 0), hudDefault.pos, Y);
+    hud.mesh.quaternion.setFromRotationMatrix(_m1);
 }
 
 function updateVRHud(I) {
@@ -856,9 +898,10 @@ function frame() {
     const now = performance.now(), dt = Math.min(0.05, (now - lastT) / 1000);
     lastT = now;
     G.time += dt;
+    SHARED.uTime.value = G.time;
     if (!G.started) {
         const e = eyePos(V());
-        for (const pl of G.sys.planets) updatePlanet(pl, e, pl === G.pl ? 3 : 1);
+        for (const pl of G.sys.planets) updatePlanet(pl, e, pl === G.pl ? 3 : 1, G.time);
         updateSky(e);
         drawHud(hud, hudInfo());
         renderer.render(scene, camera);
@@ -878,7 +921,9 @@ function frame() {
     }
     if (G.vr) updateVRHud(I);
     if (I.scanP) scan();
+    if (input.pressed.has('KeyV')) { G.opts.cockpit = !G.opts.cockpit; msg(G.opts.cockpit ? 'Cockpit view' : 'Chase view'); }
     G.warnT -= dt;
+    const wasFoot = G.mode === 'foot';
     let motion = 0;
     if (G.mode === 'foot') {
         const r = updateFoot(I, dt);
@@ -892,7 +937,17 @@ function frame() {
         motion = Math.min(1, r.ang / Math.max(dt, 1e-3) * 0.45) + (G.ship.speed > 200 ? 0.15 : 0);
         G.ship.prevSpeed = G.ship.speed;
     }
+    if (wasFoot && G.mode === 'ship' && G.vr) G.eyeY = Math.max(0.6, camera.position.y);
     placeRig();
+    // glass cockpit
+    const inCock = G.mode === 'ship' && (G.vr || G.opts.cockpit);
+    G.ship.m.group.visible = !inCock;
+    cockpit.group.visible = inCock;
+    if (inCock) {
+        cockpit.group.position.set(0, G.vr ? G.eyeY : G.eyeY, 0);
+        cockpit.t -= dt;
+        if (cockpit.t <= 0) { drawCockpit(cockpit, cockpitInfo()); cockpit.t = 1 / 15; }
+    }
     // warp sequence
     if (G.warpT > 0) {
         G.warpT -= dt;
@@ -915,11 +970,17 @@ function frame() {
     }
     // world updates
     const eye = eyePos(V());
-    for (const pl of G.sys.planets) updatePlanet(pl, eye, pl === G.pl ? 3 : 1);
+    for (const pl of G.sys.planets) updatePlanet(pl, eye, pl === G.pl ? 3 : 1, G.time);
     const onSurface = G.mode === 'foot' || altitude(G.pl, G.ship.pos) < 300;
     updateFauna(fauna, G.pl, G.mode === 'foot' ? G.foot.pos : G.ship.pos, dt, onSurface);
     updateMarkers(dt);
     updateSky(eye);
+    const pl = G.pl;
+    const nearWater = pl.p.hasSea && (G.under || (G.mode === 'foot' && altitudeRaw(pl, eye) < 40 && pl.f.raw(...upAt(pl, eye, _v3).toArray()) < pl.p.sea));
+    updateSea(sea, pl, eye, G.under, nearWater, G.time, dt);
+    const sv = _v3.set(0, 0, -1).applyQuaternion(G.ship.q).multiplyScalar(G.ship.speed);
+    const inSpace = G.ship.pos.distanceTo(pl.center) > pl.atm.outer;
+    updateStreaks(streaks, eye, sv, G.mode === 'ship' && inSpace, dt);
     // comfort vignette (VR only)
     const want = G.vr && G.opts.vignette ? Math.min(1, motion) : 0;
     G.vig += (want - G.vig) * Math.min(1, dt * 6);
@@ -936,25 +997,72 @@ function frame() {
     renderer.render(scene, camera);
 }
 
-const _sky = new THREE.Color(), _night = new THREE.Color(0.004, 0.006, 0.02);
-function updateSky(eye) {
-    const pl = G.pl, sys = G.sys;
-    const up = upAt(pl, eye, _v1);
-    const h = eye.distanceTo(pl.center) - pl.p.R - pl.p.sea;
-    const a = 1 - THREE.MathUtils.smoothstep(h, pl.p.R * 0.12, pl.p.R * 0.5);
-    const sunDir = _v2.copy(sys.sunPos).sub(pl.center).normalize();
-    const day = THREE.MathUtils.clamp(up.dot(sunDir) * 2.5 + 0.35, 0, 1);
-    _sky.copy(_night).lerp(pl.p.c.sky, day);
-    scene.background.copy(sys.bg).lerp(_sky, a);
-    scene.fog.color.copy(scene.background);
-    const far = THREE.MathUtils.lerp(400000, 2600, a * a);
-    scene.fog.far = far;
-    scene.fog.near = far * 0.06;
-    sys.stars.material.opacity = 1 - a * day;
-    sys.ambient.intensity = 0.25 + 0.35 * a * (0.4 + day * 0.6);
-    sys.ambient.color.copy(_sky).lerp(new THREE.Color(1, 1, 1), 0.5);
-    sys.stars.position.copy(eye);
+const _sky = new THREE.Color(), _c2 = new THREE.Color(), _e1 = V(), _e2 = V(), _hd = V();
+function aces(x) { return Math.min(1, Math.max(0, x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14))); }
+function toDisplay(c, out) {
+    const e = renderer.toneMappingExposure;
+    out.setRGB(aces(c.r * e), aces(c.g * e), aces(c.b * e));
+    out.convertLinearToSRGB();
+    return out;
 }
+function updateSky(eye) {
+    const pl = G.pl, sys = G.sys, atm = pl.atm, p = pl.p;
+    const cam = _v1.copy(eye).sub(pl.center);
+    const r = cam.length();
+    const up = _v2.copy(cam).divideScalar(r);
+    const seaR = p.R + p.sea;
+    const under = p.hasSea && r < seaR && pl.f.raw(up.x, up.y, up.z) < p.sea;
+    G.under = under;
+    SHARED.uUnder.value = under ? 1 : 0;
+    const day = THREE.MathUtils.clamp(up.dot(atm.sun) * 2.5 + 0.35, 0, 1);
+    const a = 1 - THREE.MathUtils.smoothstep(r, atm.inner + (atm.outer - atm.inner) * 0.35, atm.outer * 1.02);
+    // sunlight reaching the camera
+    sunTrans(atm, cam, _sky);
+    SHARED.uSunTint.value.setRGB(0.1 + _sky.r * 0.95, 0.1 + _sky.g * 0.95, 0.12 + _sky.b * 0.95);
+    SHARED.uSunCol.value.copy(sys.sunColor).lerp(_c2.setRGB(1, 1, 1), 0.6).multiply(_sky);
+    const st = (_sky.r + _sky.g + _sky.b) / 3;
+    sys.sunMeshes[0].material.color.copy(sys.sunColor).multiplyScalar(1.6).multiply(_sky);
+    sys.sunMeshes[1].material.opacity = 0.25 + 0.75 * st;
+    // horizon colour for fog and water reflections
+    _e1.set(1, 0, 0).cross(up);
+    if (_e1.lengthSq() < 1e-4) _e1.set(0, 0, 1).cross(up);
+    _e1.normalize();
+    _e2.crossVectors(up, _e1);
+    let fr = 0, fg = 0, fb = 0;
+    for (const [x, y] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        _hd.copy(_e1).multiplyScalar(x).addScaledVector(_e2, y).addScaledVector(up, 0.06).normalize();
+        skyColor(atm, cam, _hd, _c2);
+        fr += _c2.r / 4; fg += _c2.g / 4; fb += _c2.b / 4;
+    }
+    _sky.setRGB(fr, fg, fb);
+    _hd.copy(_e1).addScaledVector(up, 0.45).normalize();
+    skyColor(atm, cam, _hd, _c2);
+    SHARED.uSkyCol.value.setRGB(Math.min(1.5, _c2.r), Math.min(1.5, _c2.g), Math.min(1.5, _c2.b));
+    // ambient from the zenith sky
+    skyColor(atm, cam, up, _c2);
+    const lum = (_c2.r + _c2.g + _c2.b) / 3;
+    sys.ambient.color.setRGB(0.6, 0.65, 0.75).lerp(_c2.clone().multiplyScalar(1 / Math.max(lum, 1e-3)).multiplyScalar(0.8), Math.min(1, lum * 3) * 0.6);
+    sys.ambient.intensity = 0.14 + Math.min(0.6, lum * 0.9) * a;
+    if (under) {
+        const depth = seaR - r;
+        SHARED.uUnderCol.value.copy(p.c.water).lerp(p.c.deep, Math.min(1, depth / 30)).multiplyScalar(0.25 + 0.6 * day);
+        SHARED.uUnderDensity.value = 0.045;
+        scene.background = _bgCol.copy(SHARED.uUnderCol.value);
+        scene.fog.density = 0;
+    } else {
+        scene.background = sys.nebula;
+        scene.backgroundIntensity = 1 - a * day * 0.97;
+        toDisplay(_sky, scene.fog.color);
+        scene.fog.density = 0.0011 * a;
+    }
+    pl.sky.visible = !under;
+    if (pl.clouds) pl.clouds.visible = !under;
+    sys.stars.material.opacity = 1 - a * day;
+    sys.stars.visible = !under;
+    sys.stars.position.copy(eye);
+    cockpit.glass.material.uniforms.uSun.value.copy(atm.sun);
+}
+const _bgCol = new THREE.Color();
 
 function start() {
     if (G.started) return;
@@ -984,3 +1092,4 @@ if (hadSave) document.getElementById('play').textContent = 'Continue';
 window.G = G;
 window.R = renderer;
 window.F = fauna;
+window.THREEMat = THREE.Matrix4;
