@@ -19,7 +19,8 @@ A small No Man's Sky style game for the browser and for Meta Quest 3 (WebXR).
 - Haze over the terrain, cloud layers, a nebula skybox for each star system, and rings on some planets.
 - Oceans with waves, sun glint, transparent shallows and foam. You can dive: there is a sea floor with caustics, kelp, coral, fish, bubbles and light rays. Oxygen drains 4 times faster under water.
 - Grass and trees move in the wind.
-- Glass cockpit: in VR (and with V on desktop) the hull is hidden. A holographic HUD shows a pitch ladder, heading, speed, altitude and planet markers.
+- Glass cockpit: in first-person view the hull is hidden. Two light side bars show speed, throttle, altitude, an attitude ball and heading. In the menu you can change to a bottom bar, the full HUD, or nothing. Planet markers show on the glass when you are in space.
+- Third-person view for the astronaut and the ship (menu, or V on desktop). In VR the chase view follows only the ship's heading, so the horizon stays level.
 
 ## Run
 
@@ -41,7 +42,7 @@ WebXR needs HTTPS. GitHub Pages gives you HTTPS.
 | Where | Controls |
 |---|---|
 | Desktop, on foot | WASD move, mouse look, Space jetpack, Shift sprint, click mine, F scan, E board ship, Tab menu |
-| Desktop, in ship | W throttle, S brake, mouse pitch and yaw, A/D roll, Shift boost, Space pulse drive (in space), click laser, E land and exit, V cockpit or chase view |
+| Desktop, in ship | W throttle, S brake, mouse pitch and yaw, A/D roll, Shift boost, Space pulse drive (in space), click laser, E land and exit, V first or third person |
 | Swimming | Look where you want to go and push forward. Space (desktop) or A (Quest) swims up. |
 | Quest, on foot | Left stick move (click to sprint), right stick turn, A jetpack, right trigger mine, X scan, B board, Y menu |
 | Quest, in ship | Left trigger or left stick up throttle, left stick X yaw, right stick pitch and roll, hold right grip for hand stick, A boost, X pulse drive, right trigger laser, B land and exit |

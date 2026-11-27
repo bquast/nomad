@@ -71,9 +71,9 @@ export function drawHud(hud, info) {
     hud.rects = [];
     if (info.menu) {
         panel(ctx, 8, top + 16, W - 16, H - top - 24);
-        const cols = 2, bw = (W - 64) / cols, bh = 54;
+        const cols = 2, bw = (W - 64) / cols, bh = 46;
         info.buttons.forEach((b, i) => {
-            const x = 24 + (i % cols) * (bw + 16), yy = top + 32 + Math.floor(i / cols) * (bh + 10);
+            const x = 24 + (i % cols) * (bw + 16), yy = top + 28 + Math.floor(i / cols) * (bh + 8);
             const sel = info.sel === i || hud.hover === b.id;
             ctx.fillStyle = !b.enabled ? 'rgba(255,255,255,0.06)' : sel ? 'rgba(255,170,60,0.85)' : 'rgba(255,255,255,0.16)';
             ctx.beginPath();
@@ -81,7 +81,7 @@ export function drawHud(hud, info) {
             ctx.fill();
             ctx.fillStyle = b.enabled ? (sel ? '#1a1206' : '#fff') : '#888';
             ctx.font = '600 21px system-ui, sans-serif';
-            ctx.fillText(b.label, x + 14, yy + 34);
+            ctx.fillText(b.label, x + 14, yy + 31);
             hud.rects.push({ id: b.id, x, y: yy, w: bw - 16, h: bh, enabled: b.enabled });
         });
     }

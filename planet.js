@@ -36,29 +36,33 @@ function hsl(h, s, l) {
 }
 
 export function makeParams(seed, forceType) {
-    const r = rng(seed);
+    // r keeps the v3 order of draws, so names, colours and rings stay the same as before;
+    // r2 draws the newer Superformula settings
+    const r = rng(seed), r2 = rng((seed ^ 0x9e3779b9) >>> 0);
     const type = forceType || BIOMES[Math.floor(r() * BIOMES.length)];
     const hue = r();
     const name = makeName(r, 2 + Math.floor(r() * 2));
     const R = Math.round(1500 + r() * 1100);
+    const gravity = 7 + r() * 5;
+    r(); r(); r(); r();               // v3: continent and mountain amplitudes and frequencies
+    const oldStyle = Math.floor(r() * 4);
     const p = {
-        type, seed, name, R,
-        gravity: 7 + r() * 5,
+        type, seed, name, R, gravity,
         hasSea: true, sea: 0,
         // Superformula Flight landforms: superformula-shaped continents and mountain belts
-        relief: R * (0.085 + r() * 0.03),
-        superM: 3 + Math.floor(r() * 8), superN1: 0.45 + r() * 0.7, superN2: 1.1 + r() * 1.3, superN3: 1.1 + r() * 1.3,
-        lowland: 0.2 + r() * 0.25, beltWidth: 0.12 + r() * 0.12, mountainH: 0.62 + r() * 0.25,
-        rolling: 0.025, polar: 1.1 + r() * 0.4,
-        canopyM: 4 + Math.floor(r() * 5), canopyN1: 0.3 + r() * 0.35,
+        relief: R * (0.085 + r2() * 0.03),
+        superM: 3 + Math.floor(r2() * 8), superN1: 0.45 + r2() * 0.7, superN2: 1.1 + r2() * 1.3, superN3: 1.1 + r2() * 1.3,
+        lowland: 0.2 + r2() * 0.25, beltWidth: 0.12 + r2() * 0.12, mountainH: 0.62 + r2() * 0.25,
+        rolling: 0.025, polar: 1.1 + r2() * 0.4,
+        canopyM: 4 + Math.floor(r2() * 5), canopyN1: 0.3 + r2() * 0.35,
         flora: 1, fauna: 1, lifeDrain: 1,
-        treeStyle: r() < 0.55 ? 4 : Math.floor(r() * 4)
+        treeStyle: r2() < 0.55 ? 4 : oldStyle
     };
     const clim = {
         lush: [0.12, 0, 0.9], desert: [-0.85, 0.55, 0.25], frozen: [0.1, -0.75, 0.5], toxic: [0.3, 0.3, 0.9],
         barren: [-1, 0.2, 0], exotic: [0.2, 0.1, 1], ocean: [0.45, 0.3, 0.9]
     }[type];
-    p.moist = clim[0] + (r() - 0.5) * 0.2; p.temp = clim[1] + (r() - 0.5) * 0.2; p.veg = clim[2];
+    p.moist = clim[0] + (r2() - 0.5) * 0.2; p.temp = clim[1] + (r2() - 0.5) * 0.2; p.veg = clim[2];
     p.snowline = p.relief * 0.75;
     let c;
     if (type === 'lush') {
@@ -813,7 +817,7 @@ function ringMesh(pl) {
     tex.colorSpace = THREE.SRGBColorSpace;
     const inner = p.R * 1.55, outer = p.R * 2.7;
     const mat = new THREE.ShaderMaterial({
-        uniforms: { uBands: { value: tex }, uIn: { value: inner }, uOut: { value: outer }, uR: { value: p.R }, uSun: pl.atm.u.uSun, uCenter: pl.atm.u.uCenter },
+        uniforms: { uBands: { value: tex }, uIn: { value: inner }, uOut: { value: outer }, uR: { value: p.R }, uSun: pl.atm.u.uSun, uCenter: pl.atm.u.uCenter, uFade: { value: 1 } },
         vertexShader: `
             varying vec3 vL; varying vec3 vP;
             void main() {
@@ -823,7 +827,7 @@ function ringMesh(pl) {
                 gl_Position = projectionMatrix * viewMatrix * wp;
             }`,
         fragmentShader: `
-            uniform sampler2D uBands; uniform float uIn, uOut, uR; uniform vec3 uSun, uCenter;
+            uniform sampler2D uBands; uniform float uIn, uOut, uR, uFade; uniform vec3 uSun, uCenter;
             varying vec3 vL; varying vec3 vP;
             void main() {
                 float t = (length(vL.xy) - uIn) / (uOut - uIn);
@@ -832,7 +836,7 @@ function ringMesh(pl) {
                 vec3 P = vP - uCenter;
                 float bb = dot(P, uSun), cc = dot(P, P) - uR * uR;
                 float sh = (bb < 0.0 && bb * bb - cc > 0.0) ? 0.12 : 1.0;
-                gl_FragColor = vec4(b.rgb * sh * 0.8, b.a * 0.55);
+                gl_FragColor = vec4(b.rgb * sh * 0.8 * uFade, b.a * 0.55 * uFade);
                 #include <tonemapping_fragment>
                 #include <colorspace_fragment>
             }`,

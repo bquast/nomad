@@ -77,6 +77,26 @@ export function waterMaterial(atm, p) {
     });
 }
 
+// soft round dot (bubbles) or a vertical shaft with soft edges (rays)
+function softTex(round) {
+    const c = document.createElement('canvas');
+    c.width = 64; c.height = round ? 64 : 256;
+    const x = c.getContext('2d');
+    const img = x.createImageData(c.width, c.height);
+    for (let j = 0; j < c.height; j++) for (let i = 0; i < c.width; i++) {
+        const u = (i + 0.5) / c.width * 2 - 1, v = (j + 0.5) / c.height * 2 - 1;
+        let a;
+        if (round) { const r = Math.hypot(u, v); a = r > 1 ? 0 : (r > 0.7 ? 1 - (r - 0.7) / 0.3 : 0.35 + 0.65 * r / 0.7); }
+        else a = Math.pow(Math.max(0, 1 - u * u), 2) * Math.pow(Math.max(0, 1 - v * v), 1.5) * (0.6 + 0.4 * (1 - (v + 1) / 2));
+        const k = (j * c.width + i) * 4;
+        img.data[k] = img.data[k + 1] = img.data[k + 2] = 255; img.data[k + 3] = Math.round(a * 255);
+    }
+    x.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+}
+
 // ---------- fish ----------
 function fishGeo() {
     const body = new THREE.SphereGeometry(0.5, 8, 6).scale(0.35, 0.5, 1.2);
@@ -107,19 +127,21 @@ export function makeSea(scene) {
     const bn = 120, bp = new Float32Array(bn * 3);
     const bg = new THREE.BufferGeometry();
     bg.setAttribute('position', new THREE.BufferAttribute(bp, 3));
-    const bubbles = new THREE.Points(bg, new THREE.PointsMaterial({ color: 0xcfffff, size: 0.06, transparent: true, opacity: 0.7, depthWrite: false }));
+    const bubbles = new THREE.Points(bg, new THREE.PointsMaterial({ color: 0xdfffff, size: 0.07, map: softTex(true), transparent: true, opacity: 0.8, depthWrite: false, alphaTest: 0.02 }));
     bubbles.frustumCulled = false;
     bubbles.visible = false;
     scene.add(bubbles);
     const boff = [];
     for (let i = 0; i < bn; i++) boff.push(new THREE.Vector3((Math.random() - 0.5) * 16, Math.random() * 12 - 8, (Math.random() - 0.5) * 16));
-    // light rays
+    // light rays: soft camera-facing shafts, kept away from the camera and faded with distance
     const rays = new THREE.Group();
-    const rmat = new THREE.MeshBasicMaterial({ color: 0xbff4ff, transparent: true, opacity: 0.06, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
-    for (let i = 0; i < 10; i++) {
-        const r = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 1.6 + Math.random() * 1.5, 30, 6, 1, true).translate(0, -15, 0), rmat.clone());
-        r.userData.o = new THREE.Vector3((Math.random() - 0.5) * 40, 0, (Math.random() - 0.5) * 40);
+    const rtex = softTex(false);
+    for (let i = 0; i < 9; i++) {
+        const r = new THREE.Sprite(new THREE.SpriteMaterial({ map: rtex, color: 0xbff4ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+        const a = Math.random() * Math.PI * 2, d = 9 + Math.random() * 22;
+        r.userData.o = new THREE.Vector3(Math.cos(a) * d, -10 - Math.random() * 6, Math.sin(a) * d);
         r.userData.ph = Math.random() * 6;
+        r.scale.set(1.5 + Math.random() * 2, 26, 1);
         rays.add(r);
     }
     rays.visible = false;
@@ -191,9 +213,12 @@ export function updateSea(sea, pl, eye, under, nearWater, time, dt) {
         // rays hang from the surface above the player
         sea.rays.position.copy(_up).multiplyScalar(seaR).add(pl.center);
         sea.rays.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), _up);
+        sea.rays.updateMatrixWorld();
         for (const r of sea.rays.children) {
             r.position.copy(r.userData.o);
-            r.material.opacity = 0.035 + 0.035 * Math.sin(time * 0.8 + r.userData.ph);
+            const d = r.getWorldPosition(_t).distanceTo(eye);
+            const k = THREE.MathUtils.smoothstep(d, 6, 12) * Math.exp(-d * 0.035);
+            r.material.opacity = (0.05 + 0.04 * Math.sin(time * 0.8 + r.userData.ph)) * k;
         }
     }
 }

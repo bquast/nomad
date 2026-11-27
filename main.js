@@ -43,7 +43,7 @@ const G = {
     life: 1, jet: 1, fuel: 1,
     foot: { pos: V(), vel: V(), q: new THREE.Quaternion(), pitch: 0, onGround: false },
     ship: null,
-    opts: { vignette: true, snap: true, assist: true, hand: true, cockpit: false },
+    opts: { vignette: true, snap: true, assist: true, hand: true, third: false, frame: 'sides' },
     under: false, swim: false, eyeY: 1.25,
     menu: false, sel: 0, msgs: [], scanT: 0, warpT: 0, warped: false,
     species: new Set(), planets: new Set(),
@@ -64,6 +64,58 @@ headlamp.position.set(0, 0, -5);
 headlamp.target.position.set(0, -6, -40);
 shipModel.group.add(headlamp, headlamp.target);
 const cockpit = makeCockpit();
+const avatar = makeAvatar();
+scene.add(avatar.group);
+
+// simple astronaut for the third-person view
+function makeAvatar() {
+    const g = new THREE.Group();
+    const suit = patchTint(new THREE.MeshLambertMaterial({ color: 0xe9e6df })), dark = patchTint(new THREE.MeshLambertMaterial({ color: 0x30343b }));
+    const accent = patchTint(new THREE.MeshLambertMaterial({ color: 0xe8742a }));
+    const visor = new THREE.MeshLambertMaterial({ color: 0x1b2a3a, emissive: 0x3a6a90, emissiveIntensity: 0.35 });
+    const add = (geo, mat, x, y, z, parent) => { const o = new THREE.Mesh(geo, mat); o.position.set(x, y, z); (parent || g).add(o); return o; };
+    add(new THREE.CapsuleGeometry(0.24, 0.45, 4, 10), suit, 0, 1.12, 0);
+    add(new THREE.SphereGeometry(0.2, 14, 10), suit, 0, 1.62, 0);
+    add(new THREE.SphereGeometry(0.15, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2).rotateX(-Math.PI / 2).scale(1, 0.75, 0.6), visor, 0, 1.64, -0.12);
+    add(new THREE.BoxGeometry(0.36, 0.48, 0.2), dark, 0, 1.18, 0.26);
+    add(new THREE.BoxGeometry(0.5, 0.06, 0.3), accent, 0, 1.36, 0.02);
+    const limb = (x, y, len, r) => {
+        const pivot = new THREE.Group(); pivot.position.set(x, y, 0); g.add(pivot);
+        add(new THREE.CapsuleGeometry(r, len, 4, 8), suit, 0, -len / 2 - r, 0, pivot);
+        return pivot;
+    };
+    const legL = limb(-0.12, 0.78, 0.5, 0.09), legR = limb(0.12, 0.78, 0.5, 0.09);
+    const armL = limb(-0.33, 1.38, 0.42, 0.07), armR = limb(0.33, 1.38, 0.42, 0.07);
+    g.visible = false;
+    return { group: g, legL, legR, armL, armR, phase: 0, face: new THREE.Quaternion() };
+}
+
+function updateAvatar(dt) {
+    const show = G.mode === 'foot' && G.opts.third;
+    avatar.group.visible = show;
+    if (!show) return;
+    const F = G.foot, pl = G.pl;
+    const up = upAt(pl, F.pos, V());
+    const v = F.vel.clone().addScaledVector(up, -F.vel.dot(up));
+    const sp = v.length();
+    // face the walking direction, or the view direction when standing
+    const fw = sp > 0.4 ? v : _v1.set(0, 0, -1).applyQuaternion(F.q);
+    basisQ(up, fw, _q2);
+    avatar.face.slerp(_q2, Math.min(1, dt * 8));
+    avatar.group.position.copy(F.pos);
+    avatar.group.quaternion.copy(avatar.face);
+    avatar.phase += dt * sp * 2.2;
+    const sw = Math.sin(avatar.phase) * Math.min(0.7, sp * 0.12) * (G.swim ? 0.4 : 1);
+    avatar.legL.rotation.x = sw; avatar.legR.rotation.x = -sw;
+    avatar.armL.rotation.x = -sw * 0.8; avatar.armR.rotation.x = sw * 0.8;
+    if (G.swim) avatar.group.quaternion.multiply(_q1.setFromAxisAngle(X, -1.2));
+}
+
+function toggleView() {
+    G.opts.third = !G.opts.third;
+    msg(G.opts.third ? 'Third-person view' : 'First-person view');
+    G.hudT = 0;
+}
 rig.add(cockpit.group);
 const sea = makeSea(scene);
 const streaks = makeStreaks(scene);
@@ -254,26 +306,45 @@ function load() {
 
 // ---------- rig placement ----------
 function placeRig() {
+    const pl = G.pl;
     if (G.mode === 'foot') {
-        rig.position.copy(G.foot.pos);
-        rig.quaternion.copy(G.foot.q);
-        if (!G.vr) {
-            camera.position.set(0, 1.7, 0);
-            camera.rotation.set(G.foot.pitch, 0, 0);
+        const F = G.foot;
+        if (G.opts.third) {
+            // behind and above the astronaut, rig keeps the planet's up
+            const back = _v1.set(0, 0, 1).applyQuaternion(F.q);
+            const up = upAt(pl, F.pos, _v2);
+            rig.position.copy(F.pos).addScaledVector(back, 4.2).addScaledVector(up, G.vr ? 0.9 : 1.2);
+            const a = altitudeRaw(pl, rig.position);
+            if (a < 0.6) rig.position.addScaledVector(up, 0.6 - a);
+            rig.quaternion.copy(F.q);
+            if (!G.vr) { camera.position.set(0, 1.7, 0); camera.rotation.set(F.pitch - 0.2, 0, 0); }
+        } else {
+            rig.position.copy(F.pos);
+            rig.quaternion.copy(F.q);
+            if (!G.vr) { camera.position.set(0, 1.7, 0); camera.rotation.set(F.pitch, 0, 0); }
         }
     } else {
         const S = G.ship;
-        if (G.vr || G.opts.cockpit) {
+        if (!G.opts.third) {
             rig.position.copy(S.m.seat).applyQuaternion(S.q).add(S.pos);
             rig.quaternion.copy(S.q);
             if (!G.vr) { camera.position.set(0, G.eyeY, 0); camera.rotation.set(0, 0, 0); }
+        } else if (G.vr) {
+            // level chase view for VR: follows the heading only, so the horizon stays still
+            const up = upAt(pl, S.pos, _v2);
+            const lvl = (S.air || 0) > 0.15 ? up : _v3.set(0, 1, 0).applyQuaternion(S.q);
+            const fw = _v1.set(0, 0, -1).applyQuaternion(S.q);
+            basisQ(lvl, fw, rig.quaternion);
+            const back = _v1.set(0, 0, 1).applyQuaternion(rig.quaternion);
+            rig.position.copy(S.pos).addScaledVector(back, 16).addScaledVector(lvl, 2.2);
+            const a = altitude(pl, rig.position);
+            if (a < 1) rig.position.addScaledVector(up, 1 - a);
         } else {
             rig.position.set(0, 4.2, 17).applyQuaternion(S.q).add(S.pos);
             rig.quaternion.copy(S.q).multiply(_q1.setFromAxisAngle(X, -0.1));
             camera.position.set(0, 0, 0);
             camera.rotation.set(0, 0, 0);
-            // keep chase camera above the ground
-            const pl = G.pl, a = altitude(pl, rig.position);
+            const a = altitude(pl, rig.position);
             if (a < 1.5) rig.position.addScaledVector(upAt(pl, rig.position, _v1), 1.5 - a);
         }
     }
@@ -633,7 +704,8 @@ function cockpitInfo() {
     return {
         q: S.q, up, speed: S.speed, alt: altitude(pl, S.pos), throttle: Math.min(1, S.speed / (S.pulse ? 11000 : 950)),
         pulse: S.pulse, boost: S.boost, assist: G.opts.assist && S.pos.distanceTo(pl.center) < pl.p.R * 1.3,
-        landed: S.landed, inAtmo: S.pos.distanceTo(pl.center) < pl.atm.outer * 1.05, planets, shipPos: S.pos
+        landed: S.landed, inAtmo: S.pos.distanceTo(pl.center) < pl.atm.outer * 1.05, planets, shipPos: S.pos,
+        under: S.under, target: { name: pl.name, dist: S.pos.distanceTo(pl.center) - pl.p.R }
     };
 }
 
@@ -718,6 +790,8 @@ function buttons() {
         { id: 'snap', label: 'Turning: ' + (G.opts.snap ? 'snap 30°' : 'smooth'), enabled: true },
         { id: 'assist', label: 'Flight assist (level horizon): ' + on(G.opts.assist), enabled: true },
         { id: 'hand', label: 'Hand stick (hold right grip): ' + on(G.opts.hand), enabled: true },
+        { id: 'view', label: 'View: ' + (G.opts.third ? 'third person' : 'first person'), enabled: true },
+        { id: 'frame', label: 'Cockpit display: ' + { sides: 'side bars', bottom: 'bottom bar', hud: 'full HUD', off: 'off' }[G.opts.frame], enabled: true },
         { id: 'save', label: 'Save game', enabled: true },
         { id: 'close', label: 'Close menu', enabled: true }
     ];
@@ -733,6 +807,8 @@ function action(id) {
     else if (id === 'snap') G.opts.snap = !G.opts.snap;
     else if (id === 'assist') G.opts.assist = !G.opts.assist;
     else if (id === 'hand') G.opts.hand = !G.opts.hand;
+    else if (id === 'view') toggleView();
+    else if (id === 'frame') G.opts.frame = { sides: 'bottom', bottom: 'hud', hud: 'off', off: 'sides' }[G.opts.frame] || 'sides';
     else if (id === 'save') msg(save() ? 'Game saved' : 'Save failed (storage blocked)');
     else if (id === 'close') toggleMenu(false);
     G.hudT = 0;
@@ -819,7 +895,7 @@ for (let i = 0; i < 2; i++) {
     rig.add(grip);
 }
 const raycaster = new THREE.Raycaster();
-const hudDefault = { pos: new THREE.Vector3(0, 1.0, -1.5) };
+const hudDefault = { pos: new THREE.Vector3(-0.38, 0.85, -1.45) };
 
 function placeHudVR() {
     hud.mesh.position.copy(hudDefault.pos);
@@ -943,7 +1019,7 @@ function frame() {
     }
     if (G.vr) updateVRHud(I);
     if (I.scanP) scan();
-    if (input.pressed.has('KeyV')) { G.opts.cockpit = !G.opts.cockpit; msg(G.opts.cockpit ? 'Cockpit view' : 'Chase view'); }
+    if (input.pressed.has('KeyV')) toggleView();
     G.warnT -= dt;
     const wasFoot = G.mode === 'foot';
     let motion = 0;
@@ -962,7 +1038,8 @@ function frame() {
     if (wasFoot && G.mode === 'ship' && G.vr) G.eyeY = Math.max(0.6, camera.position.y);
     placeRig();
     // glass cockpit
-    const inCock = G.mode === 'ship' && (G.vr || G.opts.cockpit);
+    const inCock = G.mode === 'ship' && !G.opts.third;
+    updateAvatar(dt);
     G.ship.m.group.visible = true;
     for (const ch of G.ship.m.group.children) if (ch !== headlamp && ch !== headlamp.target) ch.visible = !inCock;
     headlamp.intensity = G.mode === 'ship' && G.ship.under ? 60 : 0;
@@ -970,7 +1047,7 @@ function frame() {
     if (inCock) {
         cockpit.group.position.set(0, G.vr ? G.eyeY : G.eyeY, 0);
         cockpit.t -= dt;
-        if (cockpit.t <= 0) { drawCockpit(cockpit, cockpitInfo()); cockpit.t = 1 / 15; }
+        if (cockpit.t <= 0) { cockpit.mode = G.opts.frame; drawCockpit(cockpit, cockpitInfo()); cockpit.t = 1 / 15; }
     }
     // warp sequence
     if (G.warpT > 0) {
@@ -1046,7 +1123,7 @@ function updateSky(eye) {
     SHARED.uSunCol.value.copy(sys.sunColor).lerp(_c2.setRGB(1, 1, 1), 0.6).multiply(_sky);
     const st = (_sky.r + _sky.g + _sky.b) / 3;
     sys.sunMeshes[0].material.color.copy(sys.sunColor).multiplyScalar(1.6).multiply(_sky);
-    sys.sunMeshes[1].material.opacity = 0.25 + 0.75 * st;
+    sys.sunMeshes[1].material.opacity = (0.25 + 0.75 * st) * (1 - 0.6 * a);
     // horizon colour for fog and water reflections
     _e1.set(1, 0, 0).cross(up);
     if (_e1.lengthSq() < 1e-4) _e1.set(0, 0, 1).cross(up);
@@ -1079,6 +1156,8 @@ function updateSky(eye) {
         toDisplay(_sky, scene.fog.color);
         scene.fog.density = 0.0011 * a;
     }
+    // sun glow: smaller inside the air, where the sky draws its own sun disk
+    sys.sunMeshes[1].scale.setScalar(THREE.MathUtils.lerp(16000, 5000, a));
     pl.sky.visible = !under;
     if (pl.clouds) pl.clouds.visible = !under;
     sys.stars.material.opacity = 1 - a * day;
