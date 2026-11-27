@@ -9,7 +9,8 @@ A small No Man's Sky style game for the browser and for Meta Quest 3 (WebXR).
 - Fly the ship. Land, take off, use the pulse drive in space, and mine asteroids with the ship laser.
 - Craft warp cells and warp to a new star system.
 - The game saves to localStorage every 30 seconds and after each warp.
-- Physically based sky (single scattering, Rayleigh and Mie): a blue day, red sunsets and dark nights. As you climb, the sky goes dark and the glowing limb of the planet comes into view. Each biome has its own sky colour.
+- Physically based sky (single scattering, Rayleigh and Mie): a blue day, red sunsets and dark nights. Each biome has its own sky colour.
+- Long transition from surface to space, as in Superformula Flight: near the ground the air is tall and soft, so the sky darkens slowly over about half a planet radius of climb. Then the stars come in and the air becomes a thin glowing rim around the planet (`setAtmScale` in `atmosphere.js`).
 - Haze over the terrain, cloud layers, a nebula skybox for each star system, and rings on some planets.
 - Oceans with waves, sun glint, transparent shallows and foam. You can dive: there is a sea floor with caustics, kelp, coral, fish, bubbles and light rays. Oxygen drains 4 times faster under water.
 - Grass and trees move in the wind.
@@ -27,8 +28,6 @@ python3 -m http.server 8000
 
 1. Push this folder to the `master` branch of a new repo.
 2. In the repo settings, go to Pages. Set the source to "Deploy from a branch", branch `master`, folder `/ (root)`.
-
-The `.nojekyll` file tells Pages to serve the files as they are.
 
 WebXR needs HTTPS. GitHub Pages gives you HTTPS.
 

@@ -1,7 +1,7 @@
 // planet.js - procedural planet: params, height field, cube-sphere quadtree LOD, flora
 import * as THREE from './three.module.js';
 import { rng, simplex, hash, makeName } from './noise.js';
-import { makeAtm, terrainMaterial, patchWind, skyMesh, cloudMesh } from './atmosphere.js';
+import { makeAtm, setAtmScale, terrainMaterial, patchWind, skyMesh, cloudMesh } from './atmosphere.js';
 import { waterMaterial } from './water.js';
 
 const N = 16;            // segments per chunk side
@@ -790,6 +790,7 @@ const _cam = new THREE.Vector3(), _e = new THREE.Euler();
 export function updatePlanet(pl, camWorld, budget, time) {
     _cam.copy(camWorld).sub(pl.center);
     pl.atm.u.uCam.value.copy(_cam);
+    setAtmScale(pl.atm, _cam.length() - pl.p.R);
     pl.sky.material = _cam.length() > pl.atm.outer * 1.01 ? pl.sky.userData.matF : pl.sky.userData.matV;
     if (pl.clouds) {
         _e.set(0, time * pl.clouds.userData.spin, 0);

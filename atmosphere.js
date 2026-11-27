@@ -22,7 +22,10 @@ export function makeAtm(p, center) {
     const beta = new THREE.Vector3(Math.max(a.r / m, 0.12), Math.max(a.g / m, 0.12), Math.max(a.b / m, 0.12)).multiplyScalar(2.3e-3 * dens);
     const atm = {
         inner: R, outer: R * 1.2, beta, betaM: 0.15e-3 * dens, HR: 0.035 * R, HM: 0.01 * R, sunI: 30, g: 0.76,
-        sun: center.clone().negate().normalize()
+        sun: center.clone().negate().normalize(),
+        // tall and soft near the ground, a thin rim from space (same column of air in both)
+        beta0: beta.clone(), betaM0: 0.15e-3 * dens,
+        HRin: 0.11 * R, HRout: 0.035 * R, HMin: 0.03 * R, HMout: 0.01 * R
     };
     const u = {
         uCenter: { value: center.clone() },
@@ -41,6 +44,21 @@ export function makeAtm(p, center) {
     };
     atm.u = u;
     return atm;
+}
+
+// Superformula-style transition: the air thins out over a long climb (about 0.45 R),
+// then shrinks into a thin rim seen from space. Called each frame with the camera altitude.
+export function setAtmScale(atm, alt) {
+    const R = atm.inner;
+    const t = THREE.MathUtils.smoothstep(alt, 0.05 * R, 1.35 * R);
+    atm.HR = atm.HRin + (atm.HRout - atm.HRin) * t;
+    atm.HM = atm.HMin + (atm.HMout - atm.HMin) * t;
+    atm.outer = R + 7.5 * atm.HR;
+    atm.beta.copy(atm.beta0).multiplyScalar(atm.HRout / atm.HR);
+    atm.betaM = atm.betaM0 * atm.HMout / atm.HM;
+    const u = atm.u;
+    u.uHR.value = atm.HR; u.uHM.value = atm.HM; u.uOuter.value = atm.outer;
+    u.uBetaR.value.copy(atm.beta); u.uBetaM.value = atm.betaM;
 }
 
 // Nishita single scattering, N primary samples, 4 light samples. Planet shadow comes out of the
@@ -303,7 +321,7 @@ export function skyMesh(atm) {
                 #include <colorspace_fragment>
             }`
     }, common));
-    const m = new THREE.Mesh(new THREE.SphereGeometry(atm.outer, 128, 64), matV);
+    const m = new THREE.Mesh(new THREE.SphereGeometry(atm.inner + 7.6 * atm.HRin, 128, 64), matV);
     m.userData.matV = matV;
     m.userData.matF = matF;
     m.renderOrder = 2;
