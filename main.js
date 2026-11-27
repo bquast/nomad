@@ -1,0 +1,986 @@
+// main.js - Nomad: game state, on-foot and ship logic, VR setup, main loop
+import * as THREE from './three.module.js';
+import { makeSystem, disposeSystem, nearestPlanet, makeShip, killAsteroid, systemSeed } from './world.js';
+import { updatePlanet, altitude, removeItem, shrinkItem, YIELD } from './planet.js';
+import { makeFauna, updateFauna, creaturesNear, speciesFor } from './fauna.js';
+import { makeHud, drawHud, hudHit, HUD_W, HUD_H } from './hud.js';
+import { makeInput, readDesktop, readXR, endFrame } from './input.js';
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0);
+scene.fog = new THREE.Fog(0x000000, 1e6, 1e7);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 400000);
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+});
+
+const V = () => new THREE.Vector3();
+const X = new THREE.Vector3(1, 0, 0), Y = new THREE.Vector3(0, 1, 0), Z = new THREE.Vector3(0, 0, 1);
+const _v1 = V(), _v2 = V(), _v3 = V(), _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _m1 = new THREE.Matrix4();
+
+// ---------- game state ----------
+const G = {
+    mode: 'ship', sysN: 0, sys: null, pl: null,
+    inv: { carbon: 40, ferrite: 20, dihydrogen: 40, cells: 1, units: 0 },
+    life: 1, jet: 1, fuel: 1,
+    foot: { pos: V(), vel: V(), q: new THREE.Quaternion(), pitch: 0, onGround: false },
+    ship: null,
+    opts: { vignette: true, snap: true, assist: true, hand: true },
+    menu: false, sel: 0, msgs: [], scanT: 0, warpT: 0, warped: false,
+    species: new Set(), planets: new Set(),
+    vr: false, vig: 0, hudT: 0, saveT: 30, fireT: 0, warnT: 0, time: 0
+};
+
+const input = makeInput(renderer.domElement);
+const fauna = makeFauna(scene);
+const hud = makeHud();
+document.body.appendChild(hud.canvas);
+
+// ---------- ship ----------
+const shipModel = makeShip();
+scene.add(shipModel.group);
+G.ship = { m: shipModel, pos: V(), q: new THREE.Quaternion(), speed: 0, landed: true, landing: null, lift: 0, pulse: false };
+
+// ---------- effects ----------
+function beam(color, r) {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, 1, 6, 1, true).rotateX(Math.PI / 2).translate(0, 0, -0.5),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+    m.visible = false;
+    m.frustumCulled = false;
+    scene.add(m);
+    return m;
+}
+const footBeam = beam(0xffa040, 0.025);
+const shipBeams = [beam(0x60ffd0, 0.08), beam(0x60ffd0, 0.08)];
+const hitGlow = new THREE.Mesh(new THREE.SphereGeometry(0.25, 8, 6),
+    new THREE.MeshBasicMaterial({ color: 0xffd080, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+hitGlow.visible = false;
+scene.add(hitGlow);
+
+const scanSphere = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 12),
+    new THREE.MeshBasicMaterial({ color: 0x80e0ff, wireframe: true, transparent: true, opacity: 0.4, depthWrite: false, fog: false }));
+scanSphere.visible = false;
+scene.add(scanSphere);
+
+// camera-locked comfort vignette and warp fade
+const vignette = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.6), new THREE.ShaderMaterial({
+    uniforms: { k: { value: 0 } },
+    vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform float k; varying vec2 vUv; void main(){ float d = length(vUv - 0.5) * 2.0; float a = smoothstep(0.75 - k * 0.45, 1.0 - k * 0.35, d) * min(1.0, k * 1.6); gl_FragColor = vec4(0.0, 0.0, 0.0, a); }',
+    transparent: true, depthTest: false, depthWrite: false
+}));
+vignette.position.z = -0.35;
+vignette.renderOrder = 1000;
+vignette.visible = false;
+camera.add(vignette);
+const fade = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.BackSide, transparent: true, opacity: 0, depthTest: false, depthWrite: false, fog: false }));
+fade.renderOrder = 1001;
+fade.visible = false;
+camera.add(fade);
+
+// scan markers
+const ICONS = { crystal: ['H', '#5fe8ff'], rock: ['Fe', '#ff9f5a'], pebble: ['Fe', '#ff9f5a'], plant: ['C', '#8cff7a'], tree: ['C', '#8cff7a'], fauna: ['?', '#ffe36a'] };
+const iconMats = {};
+for (const k in ICONS) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const x = c.getContext('2d');
+    x.strokeStyle = ICONS[k][1]; x.lineWidth = 5;
+    x.beginPath(); x.arc(32, 32, 26, 0, 7); x.stroke();
+    x.fillStyle = ICONS[k][1]; x.font = 'bold 26px sans-serif'; x.textAlign = 'center'; x.fillText(ICONS[k][0], 32, 42);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    iconMats[k] = new THREE.SpriteMaterial({ map: t, depthTest: false, depthWrite: false, fog: false, transparent: true });
+}
+const markers = [];
+for (let i = 0; i < 30; i++) {
+    const s = new THREE.Sprite(iconMats.crystal);
+    s.visible = false;
+    s.renderOrder = 998;
+    scene.add(s);
+    markers.push({ s, it: null, cr: null });
+}
+
+// ---------- helpers ----------
+function msg(text) {
+    G.msgs.unshift({ text, t: 6 });
+    if (G.msgs.length > 7) G.msgs.pop();
+}
+
+function eyePos(out) { return camera.getWorldPosition(out); }
+function eyeDir(out) { return camera.getWorldDirection(out); }
+
+function upAt(pl, pos, out) { return out.copy(pos).sub(pl.center).normalize(); }
+
+function basisQ(up, fwd, out) {
+    // quaternion with local +Y = up and local -Z = fwd (fwd is projected onto the tangent plane)
+    const f = _v3.copy(fwd).addScaledVector(up, -fwd.dot(up));
+    if (f.lengthSq() < 1e-6) f.set(1, 0, 0).addScaledVector(up, -up.x);
+    f.normalize();
+    const z = f.clone().negate(), x = V().crossVectors(up, z);
+    _m1.makeBasis(x, up, z);
+    return out.setFromRotationMatrix(_m1);
+}
+
+function findLand(pl, seed, sun) {
+    let s = seed;
+    const r = () => (s = (s * 16807) % 2147483647) / 2147483647;
+    const p = pl.p, d = V(), e = V(), f = V();
+    let best = null, bs = Infinity;
+    for (let i = 0; i < 1500; i++) {
+        d.set(r() - 0.5, r() - 0.5, r() - 0.5).normalize();
+        const h = pl.f.raw(d.x, d.y, d.z);
+        if (p.hasSea && h < p.sea + 3) continue;
+        const t = (h - p.sea) / p.relief;
+        if (t > 0.35) continue;
+        e.set(1, 0, 0).cross(d).normalize();
+        f.crossVectors(d, e);
+        const k = 4 / p.R;
+        const ha = pl.f.height(d.x + e.x * k, d.y + e.y * k, d.z + e.z * k);
+        const hb = pl.f.height(d.x + f.x * k, d.y + f.y * k, d.z + f.z * k);
+        const slope = Math.abs(ha - h) + Math.abs(hb - h);
+        const score = slope + (sun ? (1 - d.dot(sun)) * 3 : 0) + t * 2;
+        if (score < bs) { bs = score; best = d.clone(); }
+    }
+    return best || new THREE.Vector3(0, 1, 0);
+}
+
+function refine(pl, maxBuilds) {
+    const eye = eyePos(V());
+    let n = 0;
+    for (let i = 0; i < 60 && n < maxBuilds; i++) {
+        const b = updatePlanet(pl, eye, 40);
+        n += b;
+        if (b === 0 && pl.queue.length === 0) break;
+    }
+}
+
+function setCurrentPlanet(pl) {
+    if (G.pl === pl) return;
+    G.pl = pl;
+    for (const p of G.sys.planets) {
+        p.mat.fog = p === pl;
+        p.mat.needsUpdate = true;
+    }
+}
+
+// ---------- system / spawn ----------
+function loadSystem(n) {
+    if (G.sys) disposeSystem(G.sys);
+    G.sysN = n;
+    G.sys = makeSystem(scene, systemSeed(n), n === 0);
+    for (const pl of G.sys.planets) pl.atmo.material.uniforms.sunPos.value.copy(G.sys.sunPos);
+    G.pl = null;
+    setCurrentPlanet(G.sys.planets[0]);
+}
+
+function landShipAt(pl, dir) {
+    const S = G.ship;
+    const h = pl.f.height(dir.x, dir.y, dir.z);
+    S.pos.copy(dir).multiplyScalar(pl.p.R + h + S.m.gearH).add(pl.center);
+    basisQ(dir, V().set(dir.y, -dir.x, 0.3).normalize(), S.q);
+    S.landed = true; S.landing = null; S.speed = 0; S.lift = 0;
+}
+
+function exitShip() {
+    const S = G.ship, pl = G.pl;
+    const up = upAt(pl, S.pos, V());
+    const right = X.clone().applyQuaternion(S.q);
+    const F = G.foot;
+    F.pos.copy(S.pos).addScaledVector(right, 6.5);
+    const h = pl.f.height(...upAt(pl, F.pos, _v1).toArray());
+    F.pos.copy(_v1).multiplyScalar(pl.p.R + h).add(pl.center);
+    basisQ(_v1, V().set(0, 0, -1).applyQuaternion(S.q), F.q);
+    F.vel.set(0, 0, 0);
+    F.pitch = 0;
+    G.mode = 'foot';
+    msg('On foot. Mine with the laser, scan to find resources.');
+}
+
+function newGame() {
+    loadSystem(G.sysN);
+    const pl = G.sys.planets[0];
+    landShipAt(pl, findLand(pl, 12345 + G.sysN, G.sys.sunPos.clone().sub(pl.center).normalize()));
+    exitShip();
+    placeRig();
+    refine(pl, 400);
+}
+
+// ---------- save ----------
+function save() {
+    try {
+        localStorage.setItem('nomad-save', JSON.stringify({
+            v: 1, sysN: G.sysN, inv: G.inv, life: G.life, fuel: G.fuel, opts: G.opts,
+            species: [...G.species], planets: [...G.planets]
+        }));
+        return true;
+    } catch (e) { return false; }
+}
+
+function load() {
+    try {
+        const s = JSON.parse(localStorage.getItem('nomad-save') || 'null');
+        if (!s || s.v !== 1) return false;
+        G.sysN = s.sysN; Object.assign(G.inv, s.inv); G.life = s.life; G.fuel = s.fuel;
+        Object.assign(G.opts, s.opts);
+        G.species = new Set(s.species); G.planets = new Set(s.planets);
+        return true;
+    } catch (e) { return false; }
+}
+
+// ---------- rig placement ----------
+function placeRig() {
+    if (G.mode === 'foot') {
+        rig.position.copy(G.foot.pos);
+        rig.quaternion.copy(G.foot.q);
+        if (!G.vr) {
+            camera.position.set(0, 1.7, 0);
+            camera.rotation.set(G.foot.pitch, 0, 0);
+        }
+    } else {
+        const S = G.ship;
+        if (G.vr) {
+            rig.position.copy(S.m.seat).applyQuaternion(S.q).add(S.pos);
+            rig.quaternion.copy(S.q);
+        } else {
+            rig.position.set(0, 4.2, 17).applyQuaternion(S.q).add(S.pos);
+            rig.quaternion.copy(S.q).multiply(_q1.setFromAxisAngle(X, -0.1));
+            camera.position.set(0, 0, 0);
+            camera.rotation.set(0, 0, 0);
+            // keep chase camera above the ground
+            const pl = G.pl, a = altitude(pl, rig.position);
+            if (a < 1.5) rig.position.addScaledVector(upAt(pl, rig.position, _v1), 1.5 - a);
+        }
+    }
+}
+
+// ---------- rays ----------
+function rayItems(pl, o, d, maxT) {
+    let best = null, bt = maxT;
+    const cx0 = pl.center.x, cy0 = pl.center.y, cz0 = pl.center.z;
+    for (const it of pl.items.values()) {
+        const k = it.h * 0.5;
+        const vx = cx0 + it.pos.x + it.up.x * k - o.x, vy = cy0 + it.pos.y + it.up.y * k - o.y, vz = cz0 + it.pos.z + it.up.z * k - o.z;
+        const t = vx * d.x + vy * d.y + vz * d.z;
+        if (t < 0 || t > bt) continue;
+        const d2 = vx * vx + vy * vy + vz * vz - t * t;
+        const r = Math.max(it.r, 0.8);
+        if (d2 < r * r) { bt = t; best = it; }
+    }
+    return [best, bt];
+}
+
+function rayTerrain(pl, o, d, maxT, step) {
+    for (let t = step; t < maxT; t += step) {
+        _v2.copy(o).addScaledVector(d, t);
+        if (altitude(pl, _v2) < 0) return t;
+    }
+    return maxT;
+}
+
+function aimBeam(m, from, to) {
+    m.visible = true;
+    m.position.copy(from);
+    m.lookAt(to);
+    m.scale.set(1, 1, Math.max(0.01, from.distanceTo(to)));
+}
+
+// ---------- on foot ----------
+function updateFoot(I, dt) {
+    const F = G.foot, pl = G.pl, p = pl.p;
+    const up = upAt(pl, F.pos, V());
+    // keep rig upright as we move around the sphere
+    const rigUp = _v1.copy(Y).applyQuaternion(F.q);
+    _q1.setFromUnitVectors(rigUp, up);
+    F.q.premultiply(_q1);
+    // turning
+    let yaw = 0;
+    if (!G.vr) {
+        if (!G.menu) {
+            yaw -= I.lookX;
+            F.pitch = Math.max(-1.45, Math.min(1.45, F.pitch - I.lookY));
+        }
+    } else {
+        yaw -= I.snap * Math.PI / 6;
+        yaw -= I.turn * 2.2 * dt;
+    }
+    if (yaw) F.q.multiply(_q1.setFromAxisAngle(Y, yaw)).normalize();
+    // move
+    const fwd = eyeDir(V());
+    fwd.addScaledVector(up, -fwd.dot(up));
+    if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1).applyQuaternion(F.q);
+    fwd.normalize();
+    const right = V().crossVectors(fwd, up);
+    const raw = pl.f.raw(up.x, up.y, up.z);
+    const inWater = p.hasSea && raw < p.sea;
+    let speed = I.sprint ? 9 : 5;
+    if (inWater) speed *= 0.5;
+    const tgt = V().addScaledVector(fwd, I.my).addScaledVector(right, I.mx);
+    if (tgt.lengthSq() > 1) tgt.normalize();
+    tgt.multiplyScalar(speed);
+    let vr = F.vel.dot(up);
+    const tan = F.vel.clone().addScaledVector(up, -vr);
+    tan.lerp(tgt, Math.min(1, dt * (F.onGround ? 10 : 1.5)));
+    vr -= p.gravity * dt;
+    if (I.jet && G.jet > 0) {
+        vr += (p.gravity + 9) * dt;
+        G.jet = Math.max(0, G.jet - dt * 0.33);
+        if (I.my > 0) tan.addScaledVector(fwd, 6 * dt);
+    } else if (F.onGround) G.jet = Math.min(1, G.jet + dt * 0.5);
+    F.vel.copy(tan).addScaledVector(up, vr);
+    F.pos.addScaledVector(F.vel, dt);
+    // push out of trees and rocks
+    const lx = F.pos.x - pl.center.x, ly = F.pos.y - pl.center.y, lz = F.pos.z - pl.center.z;
+    for (const it of pl.items.values()) {
+        if (it.type !== 'tree' && it.type !== 'rock') continue;
+        const dx = lx - it.pos.x, dy = ly - it.pos.y, dz = lz - it.pos.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        const r = (it.type === 'tree' ? 0.5 * it.s : it.r * 0.9) + 0.35;
+        if (d2 < r * r && d2 > 1e-6) {
+            const d = Math.sqrt(d2);
+            const radial = dx * up.x + dy * up.y + dz * up.z;
+            if (it.type === 'tree' || radial < it.h * 1.2) {
+                F.pos.x += dx / d * (r - d); F.pos.y += dy / d * (r - d); F.pos.z += dz / d * (r - d);
+            }
+        }
+    }
+    // ground
+    const nu = upAt(pl, F.pos, V());
+    const dist = F.pos.distanceTo(pl.center);
+    const gr = pl.f.height(nu.x, nu.y, nu.z) - (inWater ? 0.6 : 0);
+    F.onGround = false;
+    if (dist - p.R <= gr + 0.01) {
+        F.pos.copy(nu).multiplyScalar(p.R + gr).add(pl.center);
+        const v2 = F.vel.dot(nu);
+        if (v2 < 0) F.vel.addScaledVector(nu, -v2);
+        F.onGround = true;
+    }
+    if (!G.planets.has(pl.name)) {
+        G.planets.add(pl.name); G.inv.units += 1000;
+        msg('Planet discovered: ' + pl.name + ' (+1000 units)');
+    }
+    // life support
+    G.life = Math.max(0, G.life - dt / (300 / p.lifeDrain));
+    if (G.life < 0.2 && G.warnT <= 0) { msg('Life support low: recharge with Carbon (menu)'); G.warnT = 20; }
+    if (G.life <= 0) {
+        msg('Life support failed. You wake up at your ship.');
+        G.life = 0.5;
+        for (const k of ['carbon', 'ferrite', 'dihydrogen']) G.inv[k] = Math.floor(G.inv[k] * 0.7);
+        G.mode = 'ship';
+        exitShip();
+    }
+    // mining laser
+    const o = V(), d = V();
+    aimRay(o, d);
+    footBeam.visible = false;
+    hitGlow.visible = false;
+    if (I.fire && !G.pointerOnHud && !G.menuBlock) {
+        const [it, t] = rayItems(pl, o, d, 35);
+        const tt = it ? t : rayTerrain(pl, o, d, 35, 0.75);
+        const end = o.clone().addScaledVector(d, tt);
+        const from = o.clone().addScaledVector(d, 0.4);
+        if (!G.vr) from.addScaledVector(V().crossVectors(d, up).normalize(), 0.25).addScaledVector(up, -0.25);
+        aimBeam(footBeam, from, end);
+        if (tt < 35) { hitGlow.visible = true; hitGlow.position.copy(end); hitGlow.scale.setScalar(1 + Math.random() * 0.6); }
+        if (it) {
+            it.hp -= dt;
+            shrinkItem(it, it.hp / it.hpMax);
+            if (it.hp <= 0) {
+                const y = YIELD[it.type];
+                const amt = Math.max(1, Math.round(y.amt * it.s));
+                G.inv[y.res] += amt;
+                removeItem(pl, it);
+                msg('+' + amt + ' ' + resName(y.res));
+            }
+        }
+    }
+    // interact
+    const nearShip = F.pos.distanceTo(G.ship.pos) < 9;
+    G.prompt = nearShip ? (G.vr ? '[B] Board ship' : '[E] Board ship') : '';
+    if (I.interactP && nearShip) {
+        G.mode = 'ship';
+        msg(G.fuel >= 0.25 ? 'Throttle up to take off.' : 'Launch thruster empty: refuel with Di-hydrogen (menu).');
+    }
+    return { moving: tan.length() > 0.5, turn: Math.abs(I.turn) };
+}
+
+function resName(k) {
+    return { carbon: 'Carbon', ferrite: 'Ferrite', dihydrogen: 'Di-hydrogen' }[k];
+}
+
+function aimRay(o, d) {
+    if (G.vr && G.ctrl.right) {
+        G.ctrl.right.getWorldPosition(o);
+        d.set(0, 0, -1).applyQuaternion(G.ctrl.right.getWorldQuaternion(_q2));
+    } else {
+        eyePos(o);
+        eyeDir(d);
+    }
+}
+
+// ---------- ship ----------
+function updateShip(I, dt) {
+    const S = G.ship;
+    const pl = nearestPlanet(G.sys, S.pos);
+    setCurrentPlanet(pl);
+    const p = pl.p;
+    const up = upAt(pl, S.pos, V());
+    const dist = S.pos.distanceTo(pl.center);
+    const inAtmo = dist < p.R * 1.3;
+    let ang = 0;
+    G.prompt = '';
+    if (S.landing) {
+        const L = S.landing;
+        L.t = Math.min(1, L.t + dt / 2.2);
+        const e = L.t * L.t * (3 - 2 * L.t);
+        S.pos.lerpVectors(L.p0, L.p1, e);
+        S.q.slerpQuaternions(L.q0, L.q1, e);
+        if (L.t >= 1) {
+            S.landing = null; S.landed = true; S.speed = 0;
+            if (!G.planets.has(pl.name)) {
+                G.planets.add(pl.name); G.inv.units += 1000;
+                msg('Planet discovered: ' + pl.name + ' (+1000 units)');
+            }
+            msg('Landed. ' + (G.vr ? '[B]' : '[E]') + ' to exit.');
+        }
+    } else if (S.landed) {
+        G.prompt = (G.vr ? '[B] Exit   [Trigger L] Take off' : '[E] Exit   [W] Take off');
+        if (I.interactP) { exitShip(); return { ang: 0 }; }
+        if (I.throttle > 0.3) {
+            if (G.fuel >= 0.25) {
+                G.fuel -= 0.25; S.landed = false; S.lift = 2.5; S.speed = 0;
+                msg('Take off. Launch fuel ' + Math.round(G.fuel * 100) + '%');
+            } else if (G.warnT <= 0) {
+                msg('Launch thruster empty: refuel with 30 Di-hydrogen (menu).');
+                G.warnT = 4;
+            }
+        }
+    } else {
+        // rotation inputs as angles for this frame
+        let rp = I.pitch * 1.1 * dt - I.lookY * 0.5;
+        let ry = I.yaw * 0.9 * dt - I.lookX * 0.5;
+        let rr = I.roll * 1.8 * dt;
+        if (G.stick && G.ctrl.right) {
+            _q1.copy(G.stick).invert().multiply(G.ctrl.right.quaternion);
+            const e = new THREE.Euler().setFromQuaternion(_q1, 'YXZ');
+            const f = v => Math.abs(v) < 0.06 ? 0 : Math.max(-1, Math.min(1, (v - Math.sign(v) * 0.06) / 0.45));
+            rp += f(e.x) * 1.2 * dt; ry += f(e.y) * 1.0 * dt; rr += f(e.z) * 1.8 * dt;
+        }
+        if (G.opts.assist && inAtmo) {
+            S.q.multiply(_q1.setFromAxisAngle(X, rp));
+            S.q.premultiply(_q1.setFromAxisAngle(up, ry + rr * 0.6));
+            const right = _v1.copy(X).applyQuaternion(S.q);
+            const e = Math.asin(Math.max(-1, Math.min(1, right.dot(up))));
+            S.q.multiply(_q1.setFromAxisAngle(Z, -e * Math.min(1, dt * 3)));
+            // keep the nose away from straight up or down
+            const fw = _v1.set(0, 0, -1).applyQuaternion(S.q);
+            const pitch = Math.asin(Math.max(-1, Math.min(1, fw.dot(up))));
+            const lim = 1.25;
+            if (Math.abs(pitch) > lim) S.q.multiply(_q1.setFromAxisAngle(X, -(pitch - Math.sign(pitch) * lim)));
+        } else {
+            S.q.multiply(_q1.setFromAxisAngle(X, rp));
+            S.q.multiply(_q1.setFromAxisAngle(Y, ry));
+            S.q.multiply(_q1.setFromAxisAngle(Z, rr));
+        }
+        S.q.normalize();
+        ang = Math.abs(rp) + Math.abs(ry) + Math.abs(rr);
+        // speed
+        let max = inAtmo ? 160 : 450;
+        if (I.boost) max *= 2.5;
+        let tgt = I.throttle > 0 ? I.throttle * max : I.throttle * 40;
+        // pulse drive: only far from planets
+        let clear = true;
+        for (const q of G.sys.planets) if (S.pos.distanceTo(q.center) < q.p.R * 1.7) clear = false;
+        S.pulse = I.pulse && clear;
+        if (S.pulse) tgt = 6000;
+        const k = S.pulse ? 0.8 : (S.speed > tgt ? 1.6 : 1.2);
+        S.speed += (tgt - S.speed) * Math.min(1, dt * k);
+        if (!clear && S.speed > 600) {
+            S.speed = 600;
+            if (I.pulse && G.warnT <= 0) { msg('Pulse drive off: too close to a planet'); G.warnT = 3; }
+        }
+        const fw = _v1.set(0, 0, -1).applyQuaternion(S.q);
+        S.pos.addScaledVector(fw, S.speed * dt);
+        if (S.lift > 0) { S.pos.addScaledVector(up, 18 * dt * Math.min(1, S.lift)); S.lift -= dt; }
+        const a = altitude(pl, S.pos);
+        if (a < S.m.gearH + 0.5) {
+            S.pos.addScaledVector(up, S.m.gearH + 0.5 - a);
+            S.speed *= 1 - Math.min(1, dt * 2);
+        }
+        // landing
+        if (a < 150 && S.speed < 90) G.prompt = G.vr ? '[B] Land' : '[E] Land';
+        if (I.interactP) {
+            if (a < 150 && S.speed < 90) {
+                const gh = pl.f.height(up.x, up.y, up.z);
+                S.landing = {
+                    t: 0, p0: S.pos.clone(), q0: S.q.clone(),
+                    p1: up.clone().multiplyScalar(p.R + gh + S.m.gearH).add(pl.center),
+                    q1: basisQ(up, fw, new THREE.Quaternion())
+                };
+                S.speed = 0;
+            } else msg('To land: get below 150 m and slow down');
+        }
+        // planet discovery when entering the atmosphere
+        if (dist < p.R * 1.1 && !G.planets.has(pl.name)) {
+            G.planets.add(pl.name); G.inv.units += 1000;
+            msg('Planet discovered: ' + pl.name + ' (+1000 units)');
+        }
+    }
+    G.life = Math.min(1, G.life + dt / 25);
+    // ship laser: asteroids
+    shipBeams[0].visible = shipBeams[1].visible = false;
+    if (I.fire && !S.landed && !G.pointerOnHud && !G.menuBlock) {
+        const fw = V().set(0, 0, -1).applyQuaternion(S.q);
+        const o = S.pos.clone().addScaledVector(fw, 5);
+        let best = null, bt = 1500;
+        for (const as of G.sys.asteroids.list) {
+            if (!as.alive) continue;
+            _v2.copy(as.pos).sub(o);
+            const t = _v2.dot(fw);
+            if (t < 0 || t > bt) continue;
+            if (_v2.lengthSq() - t * t < as.r * as.r) { bt = t; best = as; }
+        }
+        const tt = best ? bt : Math.min(bt, inAtmo ? rayTerrain(pl, o, fw, 1500, 6) : 1500);
+        const end = o.clone().addScaledVector(fw, tt);
+        const right = V().set(1, 0, 0).applyQuaternion(S.q);
+        aimBeam(shipBeams[0], o.clone().addScaledVector(right, 3.6), end);
+        aimBeam(shipBeams[1], o.clone().addScaledVector(right, -3.6), end);
+        if (best) {
+            best.hp -= dt;
+            if (best.hp <= 0) {
+                killAsteroid(G.sys, best);
+                const fe = Math.round(best.r * 2), h = Math.round(best.r * 0.6);
+                G.inv.ferrite += fe; G.inv.dihydrogen += h;
+                msg('+' + fe + ' Ferrite, +' + h + ' Di-hydrogen');
+            }
+        }
+    }
+    // visuals
+    S.m.group.position.copy(S.pos);
+    S.m.group.quaternion.copy(S.q);
+    const g = S.landed ? 0.05 : 0.3 + Math.min(1.5, S.speed / 300);
+    S.m.glow.scale.set(1, 1, g);
+    return { ang, accel: Math.abs(S.speed - (S.prevSpeed || 0)) / Math.max(dt, 1e-3) };
+}
+
+// ---------- scanner ----------
+function scan() {
+    const pl = G.pl;
+    const at = G.mode === 'foot' ? G.foot.pos : G.ship.pos;
+    if (altitude(pl, at) > 400) { msg('Scanner: too far from the surface'); return; }
+    G.scanT = 14;
+    scanSphere.visible = true;
+    scanSphere.position.copy(at);
+    G.scanAge = 0;
+    const list = [];
+    for (const it of pl.items.values()) {
+        if (it.type === 'tree') continue;
+        const d = _v1.copy(it.pos).add(pl.center).distanceTo(at);
+        if (d < 130) list.push([d, it]);
+    }
+    list.sort((a, b) => a[0] - b[0]);
+    // keep some of each kind
+    const pick = [], count = {};
+    for (const [, it] of list) {
+        count[it.type] = (count[it.type] || 0) + 1;
+        if (count[it.type] <= 6) pick.push(it);
+    }
+    pick.length = Math.min(pick.length, 24);
+    let mi = 0;
+    for (const m of markers) { m.it = null; m.cr = null; m.s.visible = false; }
+    for (const it of pick) {
+        const m = markers[mi++];
+        m.it = it; m.s.material = iconMats[it.type];
+    }
+    let found = 0;
+    for (const c of creaturesNear(fauna, at, 70)) {
+        if (mi < markers.length) { const m = markers[mi++]; m.cr = c; m.s.material = iconMats.fauna; }
+        if (!G.species.has(c.sp.id)) {
+            G.species.add(c.sp.id);
+            G.inv.units += 500;
+            msg('New species: ' + c.sp.name + ' (+500 units)');
+            found++;
+        }
+    }
+    const sp = speciesFor(pl);
+    const known = sp.filter(s => G.species.has(s.id)).length;
+    msg('Scan: ' + pick.length + ' resources, fauna ' + known + '/' + sp.length + ' known');
+}
+
+function updateMarkers(dt) {
+    if (G.scanAge !== undefined && G.scanAge < 1.5) {
+        G.scanAge += dt;
+        scanSphere.scale.setScalar(5 + G.scanAge * 90);
+        scanSphere.material.opacity = 0.45 * (1 - G.scanAge / 1.5);
+        if (G.scanAge >= 1.5) scanSphere.visible = false;
+    }
+    G.scanT -= dt;
+    const eye = eyePos(_v3);
+    for (const m of markers) {
+        if (G.scanT <= 0 || (m.it && !G.pl.items.has(m.it.key)) || (!m.it && !m.cr) || (m.cr && !m.cr.g.parent)) {
+            m.s.visible = false;
+            continue;
+        }
+        if (m.it) m.s.position.copy(m.it.pos).addScaledVector(m.it.up, m.it.h + 1.6).add(G.pl.center);
+        else m.s.position.copy(m.cr.g.position).addScaledVector(m.cr.dir, m.cr.sp.hip * 2.5 + 1.5);
+        const d = m.s.position.distanceTo(eye);
+        m.s.scale.setScalar(Math.max(0.12, d * 0.04));
+        m.s.visible = true;
+    }
+}
+
+// ---------- menu ----------
+function buttons() {
+    const I = G.inv, S = G.ship;
+    let inSpace = G.mode === 'ship' && !S.landed;
+    for (const q of G.sys.planets) if (S.pos.distanceTo(q.center) < q.p.R * 1.7) inSpace = false;
+    const on = b => b ? 'on' : 'off';
+    return [
+        { id: 'life', label: 'Recharge life support (25 Carbon)', enabled: I.carbon >= 25 && G.life < 0.99 },
+        { id: 'fuel', label: 'Refuel launch thruster (30 Di-H)', enabled: I.dihydrogen >= 30 && G.fuel < 0.99 },
+        { id: 'cell', label: 'Craft warp cell (60 Di-H, 40 Fe, 20 C)', enabled: I.dihydrogen >= 60 && I.ferrite >= 40 && I.carbon >= 20 },
+        { id: 'warp', label: inSpace ? 'Warp to a new system (1 cell)' : 'Warp: fly out to space first', enabled: inSpace && I.cells >= 1 },
+        { id: 'vig', label: 'Comfort vignette: ' + on(G.opts.vignette), enabled: true },
+        { id: 'snap', label: 'Turning: ' + (G.opts.snap ? 'snap 30°' : 'smooth'), enabled: true },
+        { id: 'assist', label: 'Flight assist (level horizon): ' + on(G.opts.assist), enabled: true },
+        { id: 'hand', label: 'Hand stick (hold right grip): ' + on(G.opts.hand), enabled: true },
+        { id: 'save', label: 'Save game', enabled: true },
+        { id: 'close', label: 'Close menu', enabled: true }
+    ];
+}
+
+function action(id) {
+    const I = G.inv;
+    if (id === 'life') { I.carbon -= 25; G.life = 1; msg('Life support recharged'); }
+    else if (id === 'fuel') { I.dihydrogen -= 30; G.fuel = 1; msg('Launch thruster refueled'); }
+    else if (id === 'cell') { I.dihydrogen -= 60; I.ferrite -= 40; I.carbon -= 20; I.cells++; msg('Warp cell crafted'); }
+    else if (id === 'warp') { I.cells--; G.warpT = 2.4; G.warped = false; toggleMenu(false); msg('Warp drive engaged'); }
+    else if (id === 'vig') G.opts.vignette = !G.opts.vignette;
+    else if (id === 'snap') G.opts.snap = !G.opts.snap;
+    else if (id === 'assist') G.opts.assist = !G.opts.assist;
+    else if (id === 'hand') G.opts.hand = !G.opts.hand;
+    else if (id === 'save') msg(save() ? 'Game saved' : 'Save failed (storage blocked)');
+    else if (id === 'close') toggleMenu(false);
+    G.hudT = 0;
+}
+
+function toggleMenu(v) {
+    G.menu = v === undefined ? !G.menu : v;
+    G.sel = 0;
+    hud.canvas.classList.toggle('open', G.menu);
+    if (!G.vr) {
+        if (G.menu) document.exitPointerLock && document.exitPointerLock();
+        else renderer.domElement.requestPointerLock && renderer.domElement.requestPointerLock();
+    }
+    G.hudT = 0;
+}
+
+hud.canvas.addEventListener('click', e => {
+    if (!G.menu) return;
+    const x = e.offsetX / hud.canvas.clientWidth * HUD_W, y = e.offsetY / hud.canvas.clientHeight * HUD_H;
+    const id = hudHit(hud, x, y);
+    if (id) action(id);
+});
+hud.canvas.addEventListener('mousemove', e => {
+    if (!G.menu) return;
+    const x = e.offsetX / hud.canvas.clientWidth * HUD_W, y = e.offsetY / hud.canvas.clientHeight * HUD_H;
+    const h = hudHit(hud, x, y);
+    if (h !== hud.hover) { hud.hover = h; G.hudT = 0; }
+});
+renderer.domElement.addEventListener('click', () => {
+    if (!G.vr && !G.menu && G.started) renderer.domElement.requestPointerLock();
+});
+
+function hudInfo() {
+    const S = G.ship, pl = G.pl, I = G.inv;
+    const pct = v => Math.round(v * 100) + '%';
+    let title, sub, bars;
+    if (G.mode === 'foot') {
+        title = pl.name;
+        sub = pl.p.type.charAt(0).toUpperCase() + pl.p.type.slice(1) + ' planet  ·  gravity ' + (pl.p.gravity / 9.8).toFixed(1) + ' g  ·  ' + G.sys.name;
+        bars = [{ label: 'Life support', v: G.life, color: '#6fe08a' }, { label: 'Jetpack', v: G.jet, color: '#5ab8ff' }];
+    } else {
+        const a = altitude(pl, S.pos);
+        const far = a > pl.p.R * 0.6;
+        title = far ? G.sys.name : pl.name;
+        const spd = S.speed > 1000 ? (S.speed / 1000).toFixed(1) + ' km/s' : Math.round(S.speed) + ' m/s';
+        sub = (S.landed ? 'Landed' : S.pulse ? 'PULSE  ' + spd : spd) + '  ·  ' +
+            (far ? 'nearest ' + pl.name + ' ' + (a / 1000).toFixed(1) + ' km' : 'altitude ' + Math.round(a) + ' m') +
+            (G.opts.assist && a < pl.p.R * 0.3 ? '  ·  assist' : '');
+        bars = [{ label: 'Launch fuel', v: G.fuel, color: '#ffb35a' }, { label: 'Life support', v: G.life, color: '#6fe08a' }];
+    }
+    return {
+        title, sub, bars,
+        inv: 'C ' + I.carbon + '   Fe ' + I.ferrite + '   Di-H ' + I.dihydrogen + '   Warp cells ' + I.cells + '   Units ' + I.units,
+        prompt: G.prompt || (G.menu ? '' : (G.vr ? '[Y] Menu  [X] Scan' : '[Tab] Menu  [F] Scan')),
+        msgs: G.msgs, menu: G.menu, buttons: G.menu ? buttons() : [], sel: G.vr ? -1 : G.sel
+    };
+}
+
+// ---------- VR ----------
+G.ctrl = { left: null, right: null, grips: [] };
+const ctrlMat = new THREE.MeshLambertMaterial({ color: 0x40464f });
+for (let i = 0; i < 2; i++) {
+    const c = renderer.xr.getController(i);
+    c.addEventListener('connected', e => {
+        c.userData.hand = e.data.handedness;
+        G.ctrl[e.data.handedness] = c;
+        if (e.data.handedness === 'right' && !c.userData.ray) {
+            const ray = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), V().set(0, 0, -1)]),
+                new THREE.LineBasicMaterial({ color: 0xffd080, transparent: true, opacity: 0.6, fog: false }));
+            ray.scale.z = 4;
+            c.add(ray);
+            c.userData.ray = ray;
+        }
+    });
+    c.addEventListener('disconnected', () => {
+        if (G.ctrl[c.userData.hand] === c) G.ctrl[c.userData.hand] = null;
+    });
+    rig.add(c);
+    const grip = renderer.xr.getControllerGrip(i);
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.035, 0.12).translate(0, -0.01, 0.02), ctrlMat);
+    grip.add(body);
+    rig.add(grip);
+}
+const raycaster = new THREE.Raycaster();
+const hudDefault = { pos: new THREE.Vector3(0, 1.0, -1.5) };
+
+function placeHudVR() {
+    rig.updateMatrixWorld();
+    hud.mesh.position.copy(hudDefault.pos);
+    hud.mesh.lookAt(rig.localToWorld(V().set(0, 1.6, 0)));
+}
+
+function updateVRHud(I) {
+    // pointer
+    G.pointerOnHud = false;
+    const R = G.ctrl.right;
+    const vis = true;
+    hud.mesh.visible = vis;
+    if (R) {
+        R.updateMatrixWorld();
+        raycaster.ray.origin.setFromMatrixPosition(R.matrixWorld);
+        raycaster.ray.direction.set(0, 0, -1).transformDirection(R.matrixWorld);
+        const hit = raycaster.intersectObject(hud.mesh, false)[0];
+        let hov = null;
+        if (hit) {
+            const x = hit.uv.x * HUD_W, y = (1 - hit.uv.y) * HUD_H;
+            hov = G.menu ? hudHit(hud, x, y) : null;
+            G.pointerOnHud = G.menu && y > 260;
+            if (R.userData.ray) R.userData.ray.scale.z = hit.distance;
+            if (I.fireP && hov) action(hov);
+        } else if (R.userData.ray) R.userData.ray.scale.z = 4;
+        if (hov !== hud.hover) { hud.hover = hov; G.hudT = 0; }
+    }
+    // grab with either grip
+    for (const hand of ['left', 'right']) {
+        const c = G.ctrl[hand];
+        if (!c) continue;
+        const pressed = hand === 'left' ? I.gripLP : I.gripRP;
+        const held = hand === 'left' ? I.gripL : I.gripR;
+        if (pressed && !G.grab) {
+            c.updateMatrixWorld();
+            raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
+            raycaster.ray.direction.set(0, 0, -1).transformDirection(c.matrixWorld);
+            const near = hud.mesh.getWorldPosition(_v1).distanceTo(raycaster.ray.origin) < 0.35;
+            if (near || raycaster.intersectObject(hud.mesh, false).length) {
+                hud.mesh.updateMatrixWorld();
+                G.grab = { c, hand, off: c.matrixWorld.clone().invert().multiply(hud.mesh.matrixWorld) };
+            }
+        }
+        if (G.grab && G.grab.hand === hand) {
+            if (!held) {
+                // do not leave it close to the face
+                const head = camera.getWorldPosition(_v1), hp = hud.mesh.getWorldPosition(_v2);
+                const d = hp.distanceTo(head);
+                if (d < 0.7) {
+                    hp.sub(head).normalize().multiplyScalar(0.7).add(head);
+                    hud.mesh.position.copy(rig.worldToLocal(hp.clone()));
+                }
+                hudDefault.pos.copy(hud.mesh.position);
+                G.grab = null;
+            } else {
+                c.updateMatrixWorld();
+                _m1.multiplyMatrices(c.matrixWorld, G.grab.off);
+                _m1.premultiply(rig.matrixWorld.clone().invert());
+                _m1.decompose(hud.mesh.position, hud.mesh.quaternion, _v3);
+            }
+        }
+    }
+    // hand stick in the ship
+    if (G.mode === 'ship' && G.opts.hand && R && !(G.grab && G.grab.hand === 'right')) {
+        if (I.gripRP && !G.grab) G.stick = R.quaternion.clone();
+        if (!I.gripR) G.stick = null;
+    } else G.stick = null;
+}
+
+async function enterVR() {
+    if (!navigator.xr) return;
+    const s = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
+    renderer.xr.setFoveation(1);
+    await renderer.xr.setSession(s);
+    G.vr = true;
+    camera.position.set(0, 0, 0);
+    camera.rotation.set(0, 0, 0);
+    rig.add(hud.mesh);
+    placeHudVR();
+    hud.canvas.style.display = 'none';
+    document.getElementById('cross').style.display = 'none';
+    s.addEventListener('end', () => {
+        G.vr = false;
+        rig.remove(hud.mesh);
+        hud.canvas.style.display = '';
+        document.getElementById('cross').style.display = '';
+        G.stick = null; G.grab = null;
+    });
+    start();
+}
+
+// ---------- main loop ----------
+let lastT = performance.now();
+
+function frame() {
+    const now = performance.now(), dt = Math.min(0.05, (now - lastT) / 1000);
+    lastT = now;
+    G.time += dt;
+    if (!G.started) {
+        const e = eyePos(V());
+        for (const pl of G.sys.planets) updatePlanet(pl, e, pl === G.pl ? 3 : 1);
+        updateSky(e);
+        drawHud(hud, hudInfo());
+        renderer.render(scene, camera);
+        return;
+    }
+    const session = renderer.xr.getSession();
+    const I = G.vr && session ? readXR(input, session, G.mode, G.opts) : readDesktop(input);
+    if (I.menuP) toggleMenu();
+    G.menuBlock = !G.vr && G.menu;
+    if (!G.vr && G.menu) {
+        const n = buttons().length;
+        if (I.selDown) { G.sel = (G.sel + 1) % n; G.hudT = 0; }
+        if (I.selUp) { G.sel = (G.sel + n - 1) % n; G.hudT = 0; }
+        if (I.selectP) { const b = buttons()[G.sel]; if (b.enabled) action(b.id); }
+        if (I.cancelP) toggleMenu(false);
+        I.lookX = I.lookY = 0;
+    }
+    if (G.vr) updateVRHud(I);
+    if (I.scanP) scan();
+    G.warnT -= dt;
+    let motion = 0;
+    if (G.mode === 'foot') {
+        const r = updateFoot(I, dt);
+        motion = (r.moving ? 0.35 : 0) + r.turn * 0.4;
+        G.ship.m.group.position.copy(G.ship.pos);
+        G.ship.m.group.quaternion.copy(G.ship.q);
+        shipBeams[0].visible = shipBeams[1].visible = false;
+    } else {
+        footBeam.visible = false; hitGlow.visible = false;
+        const r = updateShip(I, dt);
+        motion = Math.min(1, r.ang / Math.max(dt, 1e-3) * 0.45) + (G.ship.speed > 200 ? 0.15 : 0);
+        G.ship.prevSpeed = G.ship.speed;
+    }
+    placeRig();
+    // warp sequence
+    if (G.warpT > 0) {
+        G.warpT -= dt;
+        fade.visible = true;
+        const t = G.warpT;
+        fade.material.opacity = t > 1.2 ? (2.4 - t) / 1.2 : Math.max(0, t / 1.2);
+        if (t < 1.2 && !G.warped) {
+            G.warped = true;
+            loadSystem(G.sysN + 1);
+            const pl = G.sys.planets[0];
+            const d = V().set(0.3, 0.4, 1).normalize();
+            G.ship.pos.copy(pl.center).addScaledVector(d, pl.p.R * 4.5);
+            G.ship.q.setFromRotationMatrix(_m1.lookAt(G.ship.pos, pl.center, Y));
+            G.ship.speed = 0;
+            placeRig();
+            msg('Arrived: ' + G.sys.name + ' (' + G.sys.planets.length + ' planets)');
+            save();
+        }
+        if (G.warpT <= 0) fade.visible = false;
+    }
+    // world updates
+    const eye = eyePos(V());
+    for (const pl of G.sys.planets) updatePlanet(pl, eye, pl === G.pl ? 3 : 1);
+    const onSurface = G.mode === 'foot' || altitude(G.pl, G.ship.pos) < 300;
+    updateFauna(fauna, G.pl, G.mode === 'foot' ? G.foot.pos : G.ship.pos, dt, onSurface);
+    updateMarkers(dt);
+    updateSky(eye);
+    // comfort vignette (VR only)
+    const want = G.vr && G.opts.vignette ? Math.min(1, motion) : 0;
+    G.vig += (want - G.vig) * Math.min(1, dt * 6);
+    vignette.visible = G.vig > 0.02;
+    vignette.material.uniforms.k.value = G.vig;
+    // messages and HUD
+    for (const m of G.msgs) m.t -= dt;
+    G.msgs = G.msgs.filter(m => m.t > 0);
+    G.hudT -= dt;
+    if (G.hudT <= 0) { drawHud(hud, hudInfo()); G.hudT = 0.12; }
+    G.saveT -= dt;
+    if (G.saveT <= 0) { save(); G.saveT = 30; }
+    endFrame(input);
+    renderer.render(scene, camera);
+}
+
+const _sky = new THREE.Color(), _night = new THREE.Color(0.004, 0.006, 0.02);
+function updateSky(eye) {
+    const pl = G.pl, sys = G.sys;
+    const up = upAt(pl, eye, _v1);
+    const h = eye.distanceTo(pl.center) - pl.p.R - pl.p.sea;
+    const a = 1 - THREE.MathUtils.smoothstep(h, pl.p.R * 0.12, pl.p.R * 0.5);
+    const sunDir = _v2.copy(sys.sunPos).sub(pl.center).normalize();
+    const day = THREE.MathUtils.clamp(up.dot(sunDir) * 2.5 + 0.35, 0, 1);
+    _sky.copy(_night).lerp(pl.p.c.sky, day);
+    scene.background.copy(sys.bg).lerp(_sky, a);
+    scene.fog.color.copy(scene.background);
+    const far = THREE.MathUtils.lerp(400000, 2600, a * a);
+    scene.fog.far = far;
+    scene.fog.near = far * 0.06;
+    sys.stars.material.opacity = 1 - a * day;
+    sys.ambient.intensity = 0.25 + 0.35 * a * (0.4 + day * 0.6);
+    sys.ambient.color.copy(_sky).lerp(new THREE.Color(1, 1, 1), 0.5);
+    sys.stars.position.copy(eye);
+}
+
+function start() {
+    if (G.started) return;
+    G.started = true;
+    document.getElementById('start').style.display = 'none';
+    if (!G.vr) renderer.domElement.requestPointerLock();
+    msg('Welcome, traveller. Mine, scan, refuel, and fly to the stars.');
+}
+
+// ---------- boot ----------
+const hadSave = load();
+newGame();
+renderer.setAnimationLoop(frame);
+
+document.getElementById('play').onclick = () => start();
+const vrBtn = document.getElementById('vr');
+if (navigator.xr) {
+    navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+        if (ok) { vrBtn.style.display = ''; vrBtn.onclick = () => enterVR().catch(e => alert('VR failed: ' + e.message)); }
+    });
+}
+document.getElementById('reset').onclick = () => {
+    try { localStorage.removeItem('nomad-save'); } catch (e) { }
+    location.reload();
+};
+if (hadSave) document.getElementById('play').textContent = 'Continue';
+window.G = G;
+window.R = renderer;
+window.F = fauna;

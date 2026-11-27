@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nomad</title>
+<link rel="icon" href="data:,">
+<style>
+html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; color: #fff; }
+canvas { display: block; }
+#hud { position: fixed; left: 16px; bottom: 16px; width: 512px; height: 320px; pointer-events: none; }
+#hud.open { left: 50%; top: 50%; bottom: auto; width: 820px; height: 512px; transform: translate(-50%, -50%); pointer-events: auto; cursor: pointer; }
+#cross { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: rgba(255,220,150,0.9); box-shadow: 0 0 6px #000; pointer-events: none; }
+#start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle at 50% 40%, rgba(40,20,60,0.55), rgba(0,0,0,0.85)); }
+#start .box { max-width: 620px; padding: 32px 40px; background: rgba(8,14,24,0.85); border: 2px solid rgba(255,190,90,0.6); border-radius: 18px; }
+h1 { margin: 0 0 4px; font-size: 56px; letter-spacing: 10px; color: #ffd27a; }
+p { color: #cfe3ff; line-height: 1.45; }
+button { font: 600 18px system-ui, sans-serif; padding: 12px 22px; margin: 6px 8px 6px 0; border: 0; border-radius: 10px; background: #ffb04a; color: #1a1206; cursor: pointer; }
+button.alt { background: rgba(255,255,255,0.15); color: #fff; }
+table { border-collapse: collapse; font-size: 14px; color: #dde; margin-top: 12px; }
+td { padding: 2px 14px 2px 0; vertical-align: top; }
+td:first-child { color: #ffd27a; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="cross"></div>
+<div id="start"><div class="box">
+<h1>NOMAD</h1>
+<p>Walk procedural planets. Mine resources, scan the wildlife, refuel your ship, fly to space without a loading screen, then warp to a new star system.</p>
+<button id="play">Play</button><button id="vr" style="display:none">Enter VR</button><button id="reset" class="alt">New game</button>
+<table>
+<tr><td>Desktop on foot</td><td>WASD move, mouse look, Space jetpack, Shift sprint, click mine, F scan, E board ship, Tab menu</td></tr>
+<tr><td>Desktop in ship</td><td>W throttle, S brake, mouse pitch/yaw, A/D roll, Shift boost, Space pulse drive (in space), click laser, E land / exit</td></tr>
+<tr><td>Quest on foot</td><td>Left stick move (click = sprint), right stick turn, A jetpack, right trigger mine, X scan, B board, Y menu, grip on panel = move panel</td></tr>
+<tr><td>Quest in ship</td><td>Left trigger or left stick up = throttle, left stick X yaw, right stick pitch/roll, hold right grip = hand stick, A boost, X pulse drive, right trigger laser, B land / exit</td></tr>
+<tr><td>Gamepad</td><td>Left stick move, right stick look, RT mine, LT throttle, A jetpack/boost, X scan, B interact, Start menu</td></tr>
+</table>
+</div></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
