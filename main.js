@@ -59,6 +59,10 @@ document.body.appendChild(hud.canvas);
 const shipModel = makeShip();
 shipModel.group.traverse(o => { if (o.material && o.material.type === 'MeshLambertMaterial' && !o.material.transparent) patchTint(o.material); });
 scene.add(shipModel.group);
+const headlamp = new THREE.SpotLight(0xdff6ff, 0, 110, 0.55, 0.6, 1);
+headlamp.position.set(0, 0, -5);
+headlamp.target.position.set(0, -6, -40);
+shipModel.group.add(headlamp, headlamp.target);
 const cockpit = makeCockpit();
 rig.add(cockpit.group);
 const sea = makeSea(scene);
@@ -468,6 +472,11 @@ function updateShip(I, dt) {
     const up = upAt(pl, S.pos, V());
     const dist = S.pos.distanceTo(pl.center);
     const inAtmo = dist < p.R * 1.3;
+    // Superformula Flight: 'air' fades over a tall atmosphere, H = 0.45 R
+    const H = p.R * 0.45, seaAlt = dist - p.R - p.sea;
+    const air = 1 - THREE.MathUtils.smoothstep(seaAlt, 0.05 * H, H);
+    const immersion = p.hasSea ? THREE.MathUtils.smoothstep(-seaAlt, 0, 3) : 0;
+    S.air = air; S.under = immersion > 0.5;
     let ang = 0;
     G.prompt = '';
     if (S.landing) {
@@ -507,12 +516,12 @@ function updateShip(I, dt) {
             const f = v => Math.abs(v) < 0.06 ? 0 : Math.max(-1, Math.min(1, (v - Math.sign(v) * 0.06) / 0.45));
             rp += f(e.x) * 1.2 * dt; ry += f(e.y) * 1.0 * dt; rr += f(e.z) * 1.8 * dt;
         }
-        if (G.opts.assist && inAtmo) {
+        if (G.opts.assist && air > 0.15) {
             S.q.multiply(_q1.setFromAxisAngle(X, rp));
             S.q.premultiply(_q1.setFromAxisAngle(up, ry + rr * 0.6));
             const right = _v1.copy(X).applyQuaternion(S.q);
             const e = Math.asin(Math.max(-1, Math.min(1, right.dot(up))));
-            S.q.multiply(_q1.setFromAxisAngle(Z, -e * Math.min(1, dt * 3)));
+            S.q.multiply(_q1.setFromAxisAngle(Z, -e * Math.min(1, dt * 3 * air)));
             // keep the nose away from straight up or down
             const fw = _v1.set(0, 0, -1).applyQuaternion(S.q);
             const pitch = Math.asin(Math.max(-1, Math.min(1, fw.dot(up))));
@@ -525,35 +534,46 @@ function updateShip(I, dt) {
         }
         S.q.normalize();
         ang = Math.abs(rp) + Math.abs(ry) + Math.abs(rr);
-        // speed
-        let max = inAtmo ? 160 : 450;
+        // speed limit grows with altitude (Superformula Flight): ~100 m/s low, 950 m/s at the top
+        const alt0 = altitudeRaw(pl, S.pos);
+        let max = THREE.MathUtils.lerp(100, 950, THREE.MathUtils.smoothstep(alt0, 100, H));
         if (I.boost) max *= 2.5;
         S.boost = I.boost;
-        let tgt = I.throttle > 0 ? I.throttle * max : I.throttle * 40;
-        // pulse drive: only far from planets
-        let clear = true;
-        for (const q of G.sys.planets) if (S.pos.distanceTo(q.center) < q.p.R * 1.7) clear = false;
-        S.pulse = I.pulse && clear;
-        if (S.pulse) tgt = 6000;
-        const k = S.pulse ? 0.8 : (S.speed > tgt ? 1.6 : 1.2);
+        // under water: slow, like a submersible
+        if (immersion > 0.01) max = THREE.MathUtils.lerp(max, I.boost ? 55 : 34, immersion);
+        let tgt = I.throttle > 0 ? I.throttle * max : I.throttle * 30;
+        // pulse drive: brakes by itself on approach, so you arrive at the top of the atmosphere
+        let clearance = Infinity;
+        for (const q of G.sys.planets) {
+            const c = S.pos.distanceTo(q.center) - q.p.R - q.p.R * 0.45 * 1.05;
+            if (c < clearance) clearance = c;
+        }
+        if (I.pulse && !S.pulse && clearance <= 0 && G.warnT <= 0) { msg('Atmosphere detected: pulse drive off'); G.warnT = 3; }
+        S.pulse = I.pulse && clearance > 0 && immersion < 0.01;
+        if (S.pulse) tgt = Math.min(11000, Math.max(950, Math.sqrt(2 * 2200 * clearance)));
+        const k = S.pulse ? 1.2 : (S.speed > tgt ? 1.8 : 1.2);
         S.speed += (tgt - S.speed) * Math.min(1, dt * k);
-        if (!clear && S.speed > 600) {
-            S.speed = 600;
-            if (I.pulse && G.warnT <= 0) { msg('Pulse drive off: too close to a planet'); G.warnT = 3; }
-        }
+        if (S.speed > tgt && S.pulse) S.speed = tgt;
         const fw = _v1.set(0, 0, -1).applyQuaternion(S.q);
-        S.pos.addScaledVector(fw, S.speed * dt);
         if (S.lift > 0) { S.pos.addScaledVector(up, 18 * dt * Math.min(1, S.lift)); S.lift -= dt; }
-        const a = altitude(pl, S.pos);
-        if (a < S.m.gearH + 0.5) {
-            S.pos.addScaledVector(up, S.m.gearH + 0.5 - a);
-            S.speed *= 1 - Math.min(1, dt * 2);
+        // substeps so a fast approach cannot cross the ground; the sea floor is the floor
+        const steps = Math.max(1, Math.ceil(S.speed * dt / 35));
+        let a = 0;
+        for (let i = 0; i < steps; i++) {
+            S.pos.addScaledVector(fw, S.speed * dt / steps);
+            a = altitudeRaw(pl, S.pos);
+            if (a < S.m.gearH + 0.5) {
+                S.pos.addScaledVector(upAt(pl, S.pos, _v2), S.m.gearH + 0.5 - a);
+                S.speed *= 1 - Math.min(1, dt * 2);
+                a = S.m.gearH + 0.5;
+            }
         }
+        if (!S.under) a = altitude(pl, S.pos);
         // landing
         if (a < 150 && S.speed < 90) G.prompt = G.vr ? '[B] Land' : '[E] Land';
         if (I.interactP) {
             if (a < 150 && S.speed < 90) {
-                const gh = pl.f.height(up.x, up.y, up.z);
+                const gh = S.under ? pl.f.raw(up.x, up.y, up.z) : pl.f.height(up.x, up.y, up.z);
                 S.landing = {
                     t: 0, p0: S.pos.clone(), q0: S.q.clone(),
                     p1: up.clone().multiplyScalar(p.R + gh + S.m.gearH).add(pl.center),
@@ -611,7 +631,7 @@ function cockpitInfo() {
     const planets = G.sys.planets.filter(q => q !== pl || S.pos.distanceTo(q.center) > q.atm.outer)
         .map(q => ({ name: q.name, pos: q.center, dist: S.pos.distanceTo(q.center) - q.p.R }));
     return {
-        q: S.q, up, speed: S.speed, alt: altitude(pl, S.pos), throttle: Math.min(1, S.speed / (S.pulse ? 6000 : 450)),
+        q: S.q, up, speed: S.speed, alt: altitude(pl, S.pos), throttle: Math.min(1, S.speed / (S.pulse ? 11000 : 950)),
         pulse: S.pulse, boost: S.boost, assist: G.opts.assist && S.pos.distanceTo(pl.center) < pl.p.R * 1.3,
         landed: S.landed, inAtmo: S.pos.distanceTo(pl.center) < pl.atm.outer * 1.05, planets, shipPos: S.pos
     };
@@ -751,14 +771,16 @@ function hudInfo() {
     let title, sub, bars;
     if (G.mode === 'foot') {
         title = pl.name;
-        sub = pl.p.type.charAt(0).toUpperCase() + pl.p.type.slice(1) + ' planet  ·  gravity ' + (pl.p.gravity / 9.8).toFixed(1) + ' g  ·  ' + G.sys.name;
+        const fu = upAt(pl, G.foot.pos, V());
+        const bio = pl.f.biome(fu.x, fu.y, fu.z, pl.f.raw(fu.x, fu.y, fu.z));
+        sub = bio + '  ·  ' + pl.p.type.charAt(0).toUpperCase() + pl.p.type.slice(1) + ' planet  ·  ' + (pl.p.gravity / 9.8).toFixed(1) + ' g  ·  ' + G.sys.name;
         bars = [{ label: G.under ? 'Oxygen' : 'Life support', v: G.life, color: G.under ? '#7fd8ff' : '#6fe08a' }, { label: 'Jetpack', v: G.jet, color: '#5ab8ff' }];
     } else {
         const a = altitude(pl, S.pos);
         const far = a > pl.p.R * 0.6;
         title = far ? G.sys.name : pl.name;
         const spd = S.speed > 1000 ? (S.speed / 1000).toFixed(1) + ' km/s' : Math.round(S.speed) + ' m/s';
-        sub = (S.landed ? 'Landed' : S.pulse ? 'PULSE  ' + spd : spd) + '  ·  ' +
+        sub = (S.landed ? 'Landed' : S.pulse ? 'PULSE  ' + spd : spd) + (S.under ? '  ·  SUBMERGED' : '') + '  ·  ' +
             (far ? 'nearest ' + pl.name + ' ' + (a / 1000).toFixed(1) + ' km' : 'altitude ' + Math.round(a) + ' m') +
             (G.opts.assist && a < pl.p.R * 0.3 ? '  ·  assist' : '');
         bars = [{ label: 'Launch fuel', v: G.fuel, color: '#ffb35a' }, { label: 'Life support', v: G.life, color: '#6fe08a' }];
@@ -941,7 +963,9 @@ function frame() {
     placeRig();
     // glass cockpit
     const inCock = G.mode === 'ship' && (G.vr || G.opts.cockpit);
-    G.ship.m.group.visible = !inCock;
+    G.ship.m.group.visible = true;
+    for (const ch of G.ship.m.group.children) if (ch !== headlamp && ch !== headlamp.target) ch.visible = !inCock;
+    headlamp.intensity = G.mode === 'ship' && G.ship.under ? 60 : 0;
     cockpit.group.visible = inCock;
     if (inCock) {
         cockpit.group.position.set(0, G.vr ? G.eyeY : G.eyeY, 0);
@@ -1037,7 +1061,7 @@ function updateSky(eye) {
     _sky.setRGB(fr, fg, fb);
     _hd.copy(_e1).addScaledVector(up, 0.45).normalize();
     skyColor(atm, cam, _hd, _c2);
-    SHARED.uSkyCol.value.setRGB(Math.min(1.5, _c2.r), Math.min(1.5, _c2.g), Math.min(1.5, _c2.b));
+    SHARED.uSkyCol.value.setRGB(Math.min(1.5, _c2.r), Math.min(1.5, _c2.g), Math.min(1.5, _c2.b)).multiplyScalar(0.05 + 0.95 * a);
     // ambient from the zenith sky
     skyColor(atm, cam, up, _c2);
     const lum = (_c2.r + _c2.g + _c2.b) / 3;

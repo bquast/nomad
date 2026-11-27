@@ -2,6 +2,11 @@
 
 A small No Man's Sky style game for the browser and for Meta Quest 3 (WebXR).
 
+- Landforms from Superformula Flight: superformula-shaped continents and mountain belts, continental shelves and ocean basins, compressed lowlands, ridged mountains.
+- Climate from Superformula Flight: temperature from latitude and height, moisture from noise. Biomes: ocean, coast, desert, grassland, forest, rainforest, alpine, snowfield, icefield. Colours, trees and grass follow the climate. The HUD shows the biome where you stand.
+- Superformula tree canopies, with a different shape on each planet.
+- Flight model from Superformula Flight: the speed limit grows with altitude (about 100 m/s low, 950 m/s at the top of the atmosphere), the pulse drive brakes by itself and stops at the top of the atmosphere, and the level assist fades out with the air.
+- The ship is a submersible: fly into the sea and it slows down, with a headlamp. You can land on the sea floor.
 - Procedural star systems with 3 to 5 planets. Each planet has a biome: lush, desert, frozen, toxic, barren, exotic or ocean.
 - Planets are full spheres with quadtree level of detail. You can fly from the surface to space with no loading screen.
 - Walk on foot with a jetpack. Mine trees, plants, rocks and crystals with the laser.

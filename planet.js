@@ -45,11 +45,21 @@ export function makeParams(seed, forceType) {
         type, seed, name, R,
         gravity: 7 + r() * 5,
         hasSea: true, sea: 0,
-        contAmp: R * (0.035 + r() * 0.025), mountAmp: R * (0.03 + r() * 0.03),
-        f1: 1.2 + r() * 1.2, f2: 5 + r() * 4,
+        // Superformula Flight landforms: superformula-shaped continents and mountain belts
+        relief: R * (0.085 + r() * 0.03),
+        superM: 3 + Math.floor(r() * 8), superN1: 0.45 + r() * 0.7, superN2: 1.1 + r() * 1.3, superN3: 1.1 + r() * 1.3,
+        lowland: 0.2 + r() * 0.25, beltWidth: 0.12 + r() * 0.12, mountainH: 0.62 + r() * 0.25,
+        rolling: 0.025, polar: 1.1 + r() * 0.4,
+        canopyM: 4 + Math.floor(r() * 5), canopyN1: 0.3 + r() * 0.35,
         flora: 1, fauna: 1, lifeDrain: 1,
-        treeStyle: Math.floor(r() * 4)
+        treeStyle: r() < 0.55 ? 4 : Math.floor(r() * 4)
     };
+    const clim = {
+        lush: [0.12, 0, 0.9], desert: [-0.85, 0.55, 0.25], frozen: [0.1, -0.75, 0.5], toxic: [0.3, 0.3, 0.9],
+        barren: [-1, 0.2, 0], exotic: [0.2, 0.1, 1], ocean: [0.45, 0.3, 0.9]
+    }[type];
+    p.moist = clim[0] + (r() - 0.5) * 0.2; p.temp = clim[1] + (r() - 0.5) * 0.2; p.veg = clim[2];
+    p.snowline = p.relief * 0.75;
     let c;
     if (type === 'lush') {
         const g = 0.3 + (r() - 0.5) * 0.12;
@@ -93,7 +103,7 @@ export function makeParams(seed, forceType) {
             plant: hsl(0.75, 0.6, 0.5), crystal: hsl(0.3, 1, 0.55)
         };
     } else if (type === 'barren') {
-        p.hasSea = false; p.flora = 0.12; p.fauna = 0.25; p.lifeDrain = 1.4; p.mountAmp *= 1.3;
+        p.hasSea = false; p.flora = 0.12; p.fauna = 0.25; p.lifeDrain = 1.4; p.mountainH *= 1.15;
         c = {
             deep: hsl(0, 0, 0.2), water: hsl(0, 0, 0.3), shore: hsl(0.08, 0.1, 0.5),
             low: hsl(0.07 + hue * 0.05, 0.15, 0.48), mid: hsl(0.06, 0.12, 0.4), high: hsl(0.05, 0.1, 0.3),
@@ -103,7 +113,7 @@ export function makeParams(seed, forceType) {
             plant: hsl(0.12, 0.3, 0.4), crystal: hsl(0.08, 0.9, 0.6)
         };
     } else if (type === 'ocean') {
-        p.contAmp *= 0.8; p.sea = p.contAmp * 0.5; p.flora = 1.1;
+        p.sea = p.relief * 0.12; p.flora = 1.1;
         const g = 0.3 + hue * 0.12;
         c = {
             deep: hsl(0.62, 0.8, 0.18), water: hsl(0.52, 0.75, 0.4), shore: hsl(0.13, 0.5, 0.75),
@@ -114,7 +124,7 @@ export function makeParams(seed, forceType) {
             plant: hsl(0.95, 0.6, 0.55), crystal: hsl(0.15, 1, 0.6)
         };
     } else { // exotic
-        p.flora = 1.3; p.mountAmp *= 1.4; p.lifeDrain = 1.2;
+        p.flora = 1.3; p.mountainH *= 1.2; p.lifeDrain = 1.2;
         c = {
             deep: hsl(hue + 0.5, 0.6, 0.2), water: hsl(hue + 0.45, 0.8, 0.45), shore: hsl(hue + 0.1, 0.5, 0.7),
             low: hsl(hue, 0.65, 0.45), mid: hsl(hue + 0.08, 0.55, 0.35), high: hsl(hue + 0.3, 0.3, 0.35),
@@ -125,7 +135,10 @@ export function makeParams(seed, forceType) {
         };
     }
     p.c = c;
-    p.relief = p.contAmp * 0.8 + p.mountAmp * 1.2;
+    c.dry = c.shore.clone().lerp(c.rock, 0.3);
+    c.grass = c.low.clone(); c.forest = c.mid.clone();
+    c.jungle = c.mid.clone().multiplyScalar(0.7).lerp(hsl(0.4, 0.6, 0.18), 0.3);
+    c.snow = c.peak.clone(); c.ice = hsl(0.53, 0.35, 0.82);
     p.maxDepth = Math.max(3, Math.round(Math.log2(p.R * 1.5708 / 12)));
     p.bigDepth = Math.max(2, Math.round(Math.log2(p.R * 1.5708 / 100)));
     p.smallDepth = p.bigDepth + 2;
@@ -138,69 +151,114 @@ export function makeParams(seed, forceType) {
     return p;
 }
 
+export function superRadius(angle, m, n1, n2, n3) {
+    const a = Math.pow(Math.abs(Math.cos(m * angle / 4)), n2);
+    const b = Math.pow(Math.abs(Math.sin(m * angle / 4)), n3);
+    return Math.min(3, Math.pow(Math.max(a + b, 0.001), -1 / Math.max(n1, 0.05)));
+}
+
+const ss = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
 function heightFns(p) {
-    const n1 = simplex(p.seed + 11), n2 = simplex(p.seed + 23), n3 = simplex(p.seed + 37);
-    const R = p.R;
+    const nC = simplex(p.seed + 11), nD = simplex(p.seed + 23), nF = simplex(p.seed + 37);
+    const nO = simplex(p.seed + 41), nK = simplex(p.seed + 53);
+    const R = p.R, relief = p.relief;
     // lim: highest noise frequency the caller can sample without aliasing
     function fw(f, lim) {
         const k = f / lim;
         return k < 0.5 ? 1 : k > 1 ? 0 : (1 - k) * 2;
     }
+    function fbm(n, x, y, z, f, oct, lim) {
+        let v = 0, a = 1, s = 0;
+        for (let i = 0; i < oct; i++) {
+            const w = fw(f, lim);
+            if (w > 0) v += a * w * n(x * f, y * f, z * f);
+            s += a; a *= 0.5; f *= 2;
+        }
+        return v / s * 1.6;
+    }
+    function shape(x, z) {
+        return superRadius(Math.atan2(z, x), p.superM, p.superN1, p.superN2, p.superN3);
+    }
+    function region(x, y, z, sh, lim) {
+        const belt = Math.abs(fbm(nO, x, y, z, 2.4, 2, lim) + (sh - 1) * (1 - y * y) * 0.08);
+        return 1 - ss(p.beltWidth * 0.22, p.beltWidth, belt);
+    }
     function raw(x, y, z, lim) {
         lim = lim || 1e9;
-        // continents
-        let c = 0, amp = 1, f = p.f1;
-        for (let i = 0; i < 4; i++) {
-            const w = fw(f, lim);
-            if (w > 0) c += amp * w * n1(x * f, y * f, z * f);
-            amp *= 0.5; f *= 2.03;
+        const c = fbm(nC, x, y, z, 2.8, 4, lim);
+        const sh = shape(x, z);
+        const bands = (sh - 0.85) * (1 - y * y);
+        const continental = relief * (c * 0.65 - 0.015 + bands * 0.12);
+        const above = continental - p.sea;
+        let fine = 0;
+        const ff = R / 30, wf = fw(ff * 2.3, lim);
+        if (wf > 0) fine = (nF(x * ff, y * ff, z * ff) + 0.5 * nF(x * ff * 2.3, y * ff * 2.3, z * ff * 2.3)) * wf;
+        if (above <= 0) return continental + fine * 1.2;
+        const inland = ss(0, relief * 0.12, above);
+        // ridged mountain detail, three octaves
+        let ridge = 0, ra = 1, rs = 0, rf = 17;
+        for (let i = 0; i < 3; i++) {
+            const w = fw(rf, lim);
+            if (w > 0) ridge += ra * w * (1 - Math.abs(nD(x * rf, y * rf, z * rf)));
+            else ridge += ra * 0.5;
+            rs += ra; ra *= 0.45; rf *= 2.3;
         }
-        // ridged mountains
-        let m = 0, wr = 1;
-        amp = 1; f = p.f2;
-        for (let i = 0; i < 5; i++) {
-            const w = fw(f, lim);
-            if (w <= 0) break;
-            let v = 1 - Math.abs(n2(x * f, y * f, z * f));
-            v *= v * wr;
-            wr = Math.min(1, v * 2);
-            m += amp * v * w;
-            amp *= 0.5; f *= 2.1;
-        }
-        // small detail (meter scale for walking)
-        f = R / 30;
-        let d = 0;
-        const w = fw(f * 2.3, lim);
-        if (w > 0) d = (n3(x * f, y * f, z * f) + 0.5 * n3(x * f * 2.3, y * f * 2.3, z * f * 2.3)) * w;
-        const land = Math.min(1, Math.max(0, c + 0.15));
-        return c * p.contAmp + land * land * m * p.mountAmp + d * 1.6;
+        ridge /= rs;
+        const mountains = region(x, y, z, sh, lim) * p.mountainH * relief * ridge * ridge * ridge * inland;
+        const roll = fbm(nD, x, y, z, 38, 2, lim) * p.rolling * relief * inland;
+        return p.sea + Math.max(0, above * p.lowland + mountains + roll) + fine * 1.6 * inland;
     }
     function height(x, y, z) {
         const h = raw(x, y, z);
         return p.hasSea && h < p.sea ? p.sea : h;
     }
     function detail(x, y, z) {
-        return n3(x * 40, y * 40, z * 40);
+        return nF(x * 40, y * 40, z * 40);
     }
-    return { raw, height, detail };
+    // climate (Superformula Flight): temperature from latitude and height, moisture from noise
+    function moist(x, y, z) {
+        return fbm(nK, x, y, z, 5, 2, 1e9) * 0.6 + p.moist + nD(x * 32, y * 32, z * 32) * 0.16;
+    }
+    function temp(x, y, z, h) {
+        return 1.05 - Math.abs(y) * p.polar + p.temp - Math.max(0, h - p.sea) / Math.max(1, p.snowline);
+    }
+    function biome(x, y, z, h) {
+        if (p.hasSea && h < p.sea - 1) return 'Ocean';
+        if (p.hasSea && h < p.sea + 3) return 'Coast';
+        const t = temp(x, y, z, h), m = moist(x, y, z);
+        if (t < -0.15) return 'Icefield';
+        if (t < 0.05) return 'Snowfield';
+        if (h - p.sea > relief * 0.35) return 'Alpine';
+        if (p.veg === 0) return 'Barren';
+        if (m < -0.12) return 'Desert';
+        if (m > 0.32 && t > 0.45) return 'Rainforest';
+        if (m > 0.07) return 'Forest';
+        return 'Grassland';
+    }
+    return { raw, height, detail, moist, temp, biome };
 }
 
 const _c = new THREE.Color();
-function colorAt(p, h, slope, dn, out, k) {
-    const c = p.c;
-    if (p.hasSea && h < p.sea + 0.4) {
-        const t = Math.min(1, Math.max(0, (p.sea - h) / 22));
-        _c.copy(c.shore).lerp(c.seabed, t);
+function colorAt(pl, x, y, z, h, slope, out, k) {
+    const p = pl.p, c = p.c, f = pl.f;
+    const patch = f.detail(x * 0.8, y * 0.8, z * 0.8);
+    const shore = h - p.sea;
+    if (p.hasSea && shore < 0.4) {
+        _c.copy(c.shore).lerp(c.seabed, Math.min(1, Math.max(0, -shore / 22)));
     } else {
-        const t = (h - p.sea) / p.relief;
-        if (t < 0.012) _c.copy(c.shore);
-        else if (t < 0.25) _c.copy(c.low).lerp(c.mid, t / 0.25);
-        else if (t < 0.55) _c.copy(c.mid).lerp(c.high, (t - 0.25) / 0.3);
-        else if (t < 0.7) _c.copy(c.high).lerp(c.peak, (t - 0.55) / 0.15);
-        else _c.copy(c.peak);
+        const m = f.moist(x, y, z), t = f.temp(x, y, z, h);
+        _c.copy(c.dry).lerp(c.grass, ss(-0.2, -0.04, m));
+        _c.lerp(c.forest, ss(-0.01, 0.15, m));
+        _c.lerp(c.jungle, ss(0.23, 0.41, m) * ss(0.3, 0.6, t));
+        if (p.veg === 0) _c.copy(c.dry);
+        _c.lerp(c.rock, ss(p.relief * 0.3, p.relief * 0.41, shore + patch * p.relief * 0.05));
         if (slope > 0.25) _c.lerp(c.rock, Math.min(1, (slope - 0.25) * 3));
+        _c.lerp(c.snow, ss(0.12, -0.06, t + patch * 0.08) * (slope > 0.5 ? 0.4 : 1));
+        _c.lerp(c.ice, ss(-0.1, -0.3, t + patch * 0.06));
+        if (p.hasSea) _c.lerp(c.shore, 1 - ss(1.5, 5 + patch * 3, shore));
     }
-    const j = 1 + dn * 0.08;
+    const j = 1 + f.detail(x * 4.5, y * 4.5, z * 4.5) * 0.07;
     out[k] = _c.r * j; out[k + 1] = _c.g * j; out[k + 2] = _c.b * j;
 }
 
@@ -272,7 +330,7 @@ function buildChunk(pl, node) {
         nor[o] = nx; nor[o + 1] = ny; nor[o + 2] = nz;
         const dx = _dir[k * 3], dy = _dir[k * 3 + 1], dz = _dir[k * 3 + 2];
         const slope = 1 - (nx * dx + ny * dy + nz * dz);
-        colorAt(p, _raw[k], slope, pl.f.detail(dx, dy, dz), col, o);
+        colorAt(pl, dx, dy, dz, _raw[k], slope, col, o);
     }
     const skirt = node.ws * 0.1 + 1;
     for (let e = 0; e < EDGES.length; e++) {
@@ -440,8 +498,31 @@ function mergeColored(parts, upNormals) {
     return g;
 }
 
+// Superformula Flight canopy: a lathe whose cross-section is a superformula
+function treeSuper(p) {
+    const c = p.c, rings = 7, segs = Math.max(12, Math.min(24, p.canopyM * 3)), ps = [], cs = [];
+    const pt = (j, i) => {
+        const t = j / rings, ang = i / segs * Math.PI * 2;
+        const r = superRadius(ang, p.canopyM, p.canopyN1, 1.3, 1.3);
+        const w = t < 0.23 ? 0.09 : Math.pow(Math.max(0, Math.sin((t - 0.23) / 0.77 * Math.PI)), 0.65) * (0.8 - t * 0.3);
+        return [Math.cos(ang) * r * w * 3.6, t * 2.2 * 3.6, Math.sin(ang) * r * w * 3.6];
+    };
+    for (let j = 0; j < rings; j++) for (let i = 0; i < segs; i++) {
+        const a = pt(j, i), b = pt(j, i + 1), d = pt(j + 1, i), e = pt(j + 1, i + 1);
+        const col = j < 2 ? c.trunk : c.leaf.clone().multiplyScalar(0.75 + (j % 3) * 0.12 + j * 0.03);
+        for (const v of [a, d, b, b, d, e]) { ps.push(...v); cs.push(col.r, col.g, col.b); }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(ps, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(cs, 3));
+    g.computeVertexNormals();
+    g.computeBoundingSphere();
+    return g;
+}
+
 function treeGeo(p) {
     const c = p.c, s = p.treeStyle;
+    if (s === 4) return treeSuper(p);
     const leaf2 = c.leaf.clone().multiplyScalar(1.35);
     const trunk = new THREE.CylinderGeometry(0.25, 0.45, 4, 5).translate(0, 2, 0);
     if (s === 0) {
@@ -522,7 +603,7 @@ function makePools(pl) {
     const p = pl.p, c = p.c, atm = pl.atm;
     const lam = (amt, kelp, extra) => patchWind(new THREE.MeshLambertMaterial(Object.assign({ vertexColors: true }, extra || {})), atm, amt, kelp);
     const defs = {
-        tree: [treeGeo(p), lam(0.0035), 2500],
+        tree: [treeGeo(p), lam(0.0035, false, p.treeStyle === 4 ? { side: THREE.DoubleSide } : null), 2500],
         rock: [mergeColored([[new THREE.DodecahedronGeometry(1.6, 0).scale(1.3, 0.8, 1), c.rock]]), lam(0), 800],
         plant: [mergeColored([
             [new THREE.ConeGeometry(0.5, 1.4, 5).translate(0, 0.7, 0), c.plant.clone().multiplyScalar(0.6), c.plant],
@@ -608,12 +689,13 @@ function spawnFlora(pl, node, kind) {
     if (!pl.pools) makePools(pl);
     const r = rng(hash(p.seed + ':' + node.key + kind));
     const area = node.ws * node.ws;
-    const dens = kind === 'big' ? 0.0035 * p.flora : 0.02 * Math.max(0.35, p.flora);
+    const dens = kind === 'big' ? 0.0038 * p.flora : 0.02 * Math.max(0.35, p.flora);
     const count = Math.min(200, Math.round(area * dens));
     const items = [];
     for (let k = 0; k < count; k++) {
         const a = node.x + r() * node.size, b = node.y + r() * node.size;
         const roll = r(), sc = 0.7 + r() * 0.7, rot = r() * 6.283;
+        let sizeBoost = 1;
         cubeDir(node.face, a, b, _d);
         const h = pl.f.raw(_d[0], _d[1], _d[2]);
         const under = p.hasSea && h < p.sea - 1.2;
@@ -629,9 +711,13 @@ function spawnFlora(pl, node, kind) {
             else if (roll < 0.86) type = 'crystal';
             else continue;
         } else if (kind === 'big') {
-            const mask = pl.f.detail(_d[0] * 0.2, _d[1] * 0.2, _d[2] * 0.2);
-            if (roll < 0.7) { if (mask < -0.15) continue; type = 'tree'; }
-            else type = 'rock';
+            const m = pl.f.moist(_d[0], _d[1], _d[2]), tt = pl.f.temp(_d[0], _d[1], _d[2], h);
+            const forest = ss(-0.01, 0.15, m) * p.veg, rain = ss(0.23, 0.41, m) * ss(0.3, 0.6, tt);
+            const treeChance = (forest * 0.9 + ss(-0.2, -0.04, m) * 0.1) * ss(0.0, 0.15, tt);
+            if (roll < 0.75 * treeChance + 0.05 * p.veg) type = 'tree';
+            else if (roll > 0.82) type = 'rock';
+            else continue;
+            if (type === 'tree' && rain > 0.5) sizeBoost = 1.4;
         } else {
             if (roll < 0.45) type = 'plant';
             else if (roll < 0.8) type = 'pebble';
@@ -643,7 +729,7 @@ function spawnFlora(pl, node, kind) {
         const pool = pl.pools[type];
         const idx = poolAlloc(pool);
         if (idx < 0) continue;
-        const s = type === 'tree' ? sc * (0.9 + p.flora * 0.3) : type === 'kelp' ? sc * 1.2 : sc;
+        const s = type === 'tree' ? sc * (0.9 + p.flora * 0.3) * sizeBoost : type === 'kelp' ? sc * 1.2 : sc;
         const pos = place(pl, pool, idx, _d, h, s, rot, r);
         const y = YIELD[type];
         const it = { key, type, pool, idx, pos, up: _v.clone(), r: y.r * s, hp: y.hp, hpMax: y.hp, s, h: y.h * s };
@@ -668,8 +754,8 @@ function spawnGrass(pl, node) {
         if (p.hasSea && h < p.sea + 0.6) continue;
         const t = (h - p.sea) / p.relief;
         if (t > 0.42) continue;
-        const mask = pl.f.detail(_d[0] * 0.5, _d[1] * 0.5, _d[2] * 0.5);
-        if (mask < -0.55) continue;
+        const gm = ss(-0.25, -0.05, pl.f.moist(_d[0], _d[1], _d[2])) * ss(0.02, 0.2, pl.f.temp(_d[0], _d[1], _d[2], h));
+        if (r() > gm) continue;
         const idx = poolAlloc(pool);
         if (idx < 0) break;
         place(pl, pool, idx, _d, h + 0.1, sc, rot, r);
@@ -845,3 +931,4 @@ export function altitudeRaw(pl, worldPos) {
     _u.divideScalar(r);
     return r - pl.p.R - pl.f.raw(_u.x, _u.y, _u.z);
 }
+export const _test = { heightFns };
